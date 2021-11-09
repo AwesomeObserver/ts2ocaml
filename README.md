@@ -40,7 +40,7 @@ An in-browser version may be available in future.
 For users:
 - [Common options](docs/common_options.md) among all the targets
 - [ts2ocaml for js_of_ocaml](docs/js_of_ocaml.md)
-- ts2ocaml for ReScript (planned)
+- [ts2ocaml for ReScript](docs/rescript.md)
 
 For developers and contributors:
 - [Overview for developers](docs/development.md)
