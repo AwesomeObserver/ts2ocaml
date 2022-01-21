@@ -1,5 +1,7 @@
 module Target
 
+open Ts2Ml
+open Common
 open Syntax
 open Yargs
 
@@ -7,12 +9,15 @@ type ITarget<'Options when 'Options :> GlobalOptions> =
   abstract Command: string
   abstract Description: string
   abstract Builder: (Argv<'Options> -> Argv<'Options>)
-  abstract Run: sources:SourceFile list * options:'Options -> unit
+  abstract Run: input: Input * baseCtx:IContext<'Options> -> unit
 
 open Fable.Core
 open Fable.Core.JsInterop
 
-let register (parse: GlobalOptions -> string[] -> SourceFile list) (target: ITarget<'TargetOptions>) (argv: Argv<'Options>) : Argv<'Options>
+let inline has name value =
+  isIn name value
+
+let register (parse: GlobalOptions -> string[] -> Input) (target: ITarget<'TargetOptions>) (argv: Argv<'Options>) : Argv<'Options>
   when 'Options :> GlobalOptions
   and  'TargetOptions :> GlobalOptions =
   argv.command(
@@ -21,12 +26,14 @@ let register (parse: GlobalOptions -> string[] -> SourceFile list) (target: ITar
     builder = U3.Case2 (fun argv ->
       (target.Builder !!argv).positional("inputs", {| describe = ".d.ts files to generate a binding" |})
     ),
-    handler = (fun (argv: Arguments<'Options>) ->
-      let inputs = argv.["inputs"] :?> string[]
-      let srcs = parse !!argv.Options inputs
+    handler = (fun (args: Arguments<'Options>) ->
+      let inputs = args.["inputs"] :?> string[]
       try
-        target.Run(srcs, !!argv.Options)
+        let input = parse !!args.Options inputs
+        let baseCtx = createBaseContext !!args.Options
+        target.Run(input, baseCtx)
       with
         e ->
           eprintfn "%s" e.StackTrace
+          argv.exit(-1, e)
       ))

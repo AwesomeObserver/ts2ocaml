@@ -1,5 +1,6 @@
 module Targets.JsOfOCaml.Target
 
+open Ts2Ml
 open Syntax
 open DataTypes
 
@@ -11,13 +12,15 @@ open Fable.Core.JsInterop
 let private builder (argv: Yargs.Argv<Options>) : Yargs.Argv<Options> =
   argv |> Options.register
 
-let private run (srcs: SourceFile list) (options: Options) =
+let private run (input: Input) (ctx: IContext<Options>) =
   let outputDir =
     let curdir = Node.Api.``process``.cwd()
-    match options.outputDir with
+    match ctx.options.outputDir with
     | None -> curdir
     | Some dir ->
-      let path = Node.Api.path.join [|curdir; dir|]
+      let path =
+        if Node.Api.path.isAbsolute dir then dir
+        else Node.Api.path.join [|curdir; dir|]
       let fail () =
         failwithf "The output directory '%s' does not exist." path
       try
@@ -27,37 +30,42 @@ let private run (srcs: SourceFile list) (options: Options) =
         _ -> fail ()
 
   let results =
-    if options.createMinimalStdlib then
-      [{ fileName = "ts2ocaml_min.mli"; content = Text.str stdlib; stubLines = [] }]
+    let result =
+      if ctx.options.createMinimalStdlib then
+        [{ fileName = "ts2ocaml_min.mli"; content = Text.str stdlib; stubLines = [] }]
+      else []
+    if List.isEmpty input.sources then result
+    else if ctx.options.stdlib then
+      result @ emitStdlib input ctx
     else
-      if List.isEmpty srcs then
-        Log.warnf options "No input file given."
-        []
-      else if options.stdlib then
-        emitStdlib srcs options
-      else
-        emitEverythingCombined srcs options
+      result @ emit input ctx
+
+  if results = [] then
+    ctx.logger.warnf "no input files are given."
 
   for result in results do
     let fullPath = Node.Api.path.join[|outputDir; result.fileName|]
-    Log.tracef options "* writing the binding to '%s'..." fullPath
+    ctx.logger.tracef "* writing the binding to '%s'..." fullPath
     Node.Api.fs.writeFileSync(fullPath, Text.toString 2 result.content)
 
-    let stubFile = Node.Api.path.join [|outputDir; options.stubFile|]
-    if not (List.isEmpty result.stubLines) then
-      let existingStubLines =
-        if not (Node.Api.fs.existsSync(!^stubFile)) then Set.empty
-        else if Node.Api.fs.lstatSync(!^stubFile).isFile() then
-          Node.Api.fs.readFileSync(stubFile, "UTF-8")
-                     .Split([|Node.Api.os.EOL|], System.StringSplitOptions.RemoveEmptyEntries)
-          |> Set.ofArray
-        else
-          failwithf "The path '%s' is not a file." stubFile
-      let stubLines = Set.union existingStubLines (Set.ofList result.stubLines)
-      if stubLines <> existingStubLines then
-        Log.tracef options "* writing the stub file to '%s'..." stubFile
-        let stub = stubLines |> String.concat Node.Api.os.EOL
-        Node.Api.fs.writeFileSync(stubFile, stub)
+  let newStubLines =
+    results |> List.collect (fun result -> result.stubLines) |> Set.ofList
+
+  if not (Set.isEmpty newStubLines) then
+    let stubFile = Node.Api.path.join [|outputDir; ctx.options.stubFile|]
+    let existingStubLines =
+      if not (Node.Api.fs.existsSync(!^stubFile)) then Set.empty
+      else if Node.Api.fs.lstatSync(!^stubFile).isFile() then
+        Node.Api.fs.readFileSync(stubFile, "UTF-8")
+                    .Split([|Node.Api.os.EOL|], System.StringSplitOptions.RemoveEmptyEntries)
+        |> Set.ofArray
+      else
+        failwithf "The path '%s' is not a file." stubFile
+    let stubLines = Set.union existingStubLines newStubLines
+    if stubLines <> existingStubLines then
+      ctx.logger.tracef "* writing the stub file to '%s'..." stubFile
+      let stub = stubLines |> String.concat Node.Api.os.EOL
+      Node.Api.fs.writeFileSync(stubFile, stub)
 
 let target =
   { new ITarget<Options> with

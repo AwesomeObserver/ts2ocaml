@@ -15,14 +15,7 @@ The documentation for the `ts2ocaml` command and its options comes after the wal
 
 `ts2ocaml` for `js_of_ocaml` generates `.mli` files, which should then be processed with [`LexiFi/gen_js_api`](https://github.com/LexiFi/gen_js_api).
 
-You should use the latest `gen_js_api` as `ts2ocaml` uses the latest features of `gen_js_api`.
-As of Oct 2021, most of the required features have not been present in the latest version in opam.
-So you would have to either do
-
-* `opam pin add gen_js_api https://github.com/LexiFi/gen_js_api.git` **(recommended)**, or
-* `git submodule` [their repository](https://github.com/LexiFi/gen_js_api) to the `lib` directory of your OCaml project.
-  - Note that if you use `gen_js_api` via a submodule, it might conflict with [`ts2ocaml-jsoo-stdlib`](#using-ts2ocaml-jsoo-stdlib-package) which is installed via `ocaml pin add`.
-  - Therefore, this would work only if you are going to do [`ts2ocaml jsoo --create-minimal-lib`](#using---create-minimal-lib--create-minimal-stdlib).
+You should use `gen_js_api` version 1.0.9 or higher, as `ts2ocaml` uses the latest features of `gen_js_api`.
 
 ## Adding the standard library
 
@@ -40,8 +33,7 @@ To fulfill both needs, we've made two ways to add the standard library.
 
 This package contains the full bindings for JS, DOM, and Web Worker API, generated with the [`full` preset](#choosing-a-preset).
 
-As described in [Requirements](#requirements), `ts2ocaml` needs the latest `gen_js_api`, which is still not present in OPAM repository.
-So, `ts2ocaml-jsoo-stdlib` is currently **not in OPAM repository**.
+`ts2ocaml-jsoo-stdlib` is currently **not in OPAM repository**.
 
 To install it to your OPAM switch, we recommend you to use [`opam pin`](https://opam.ocaml.org/doc/Usage.html#opam-pin).
 
@@ -52,9 +44,9 @@ Check the version of `ts2ocaml` with `ts2ocaml --version` and do the following:
 opam pin add ts2ocaml-jsoo-stdlib https://github.com/ocsigen/ts2ocaml.git#jsoo-stdlib-vX.Y.Z
 ```
 
-### Using [`--create-minimal-lib`](#--create-minimal-stdlib)
+### Using [`--create-minimal-stdlib`](#--create-minimal-stdlib)
 
-`ts2ocaml jsoo --create-minimal-lib` generates a minimal standard library for `ts2ocaml`.
+`ts2ocaml jsoo --create-minimal-stdlib` generates a minimal standard library for `ts2ocaml`.
 
 It only contains the following definitions:
 * `-'tags intf` type, which is used for [tag-based subtyping](#feature-tag).
@@ -153,17 +145,122 @@ let () =
 > * [JavaScript compilation in dune](https://dune.readthedocs.io/en/latest/jsoo.html)
 > * [`gen_js_api`](https://github.com/LexiFi/gen_js_api/blob/master/INSTALL_AND_USE.md)
 
+## Handling `import` and `export`
+
+To work with multiple files and packages, ts2ocaml has some conventions around the name of the generated OCaml source codes.
+
+1. If not known, ts2ocaml computes the JS module name of the input `.d.ts` file by [heuristics](#how-the-heuristics-work).
+2. ts2ocaml converts the JS module name to a OCaml module name by the followings:
+    - Removes `@` at the top of the module name
+    - Replaces `/` with `__`
+    - Replaces any other signs (such as `-`) to `_`
+3. ts2ocaml uses the OCaml module name as the output file name.
+
+### How the heuristics work
+
+* If the filename is equal to `types` or `typings` of `package.json`, then ts2ocaml will use the package name itself.
+  - input: `node_modules/typescript/lib/typescript.d.ts`
+  - `package.json`: `"typings": "./lib/typescript.d.ts",`
+  - `getJsModuleName`: `typescript`
+  - output file: `typescript.mli`
+* If the filename is present in `exports` of `package.json`, then ts2ocaml will combine the package name and the exported module name.
+  - input: `node_modules/@angular/common/http/http.d.ts`
+  - `package.json`: `"exports": { .., "./http": { "types": "./http/http.d.ts", .. }, .. }`
+  - `getJsModuleName`: `@angualr/common/http`
+  - output file: `angular__common__http.mli`
+* Otherwise, ts2ocaml uses a heuristic module name: it will combine the package name and the filename. `index.d.ts` is handled specially.
+  - input: `node_modules/cassandra-driver/lib/auth/index.d.ts`
+  - `getJsModuleName`: `cassandra-driver/auth`
+  - output file: `cassandra_driver__auth.mli`
+  - if `package.json` is not present, the package name is also inferred heuristically from the filename.
+
+### How the `import` statements are translated
+
+* `import` of another package from `node_modules` will be converted to an `open` statement or a module alias.
+  - The OCaml module name of the imported package is computed by the step 2 of [the above](#handling-import-and-export).
+
+```typescript
+// node_modules/@types/react/index.d.ts
+import * as CSS from 'csstype';
+import { Interaction as SchedulerInteraction } from 'scheduler/tracing';
+...
+```
+```ocaml
+(* react.mli *)
+module CSS = Csstype.Export
+module SchedulerInteraction = Scheduler__tracing.Export.Interaction
+...
+```
+
+* `import` of relative path will be converted to an `open` statement or a module alias.
+  - The OCaml module name of the imported file will also be inferred by [heuristics](#how-the-heuristics-work).
+```typescript
+// node_modules/cassandra-driver/index.d.ts
+import { auth } from './lib/auth';
+```
+
+```ocaml
+(* cassandra_driver.mli *)
+module Auth = Cassandra_driver__auth.Export.Auth
+```
+
+```typescript
+// node_modules/cassandra-driver/lib/mapping/index.d.ts
+import { Client } from '../../';
+```
+
+```ocaml
+(* cassandra_driver__mapping.mli *)
+module Client = Cassandra_driver.Export.Client
+```
+
+* Indirect `import` using identifiers is not yet be supported.
+
+```typescript
+import { types } from './lib/types';
+import Uuid = types.Uuid; // we should be able to convert this to `module Uuid = Type.Uuid`, but not yet
+```
+
+* Direct `export` of an external module **will not be supported**.
+
+```typescript
+export { someFunction } from './lib/functions'; // this is VERY hard to do in OCaml!
+```
+
+### How the `export` statements are translated
+
+ts2ocaml will create a module named `Export` to represent the exported definitions.
+
+* If an export assignment `export = Something` is used, the `Export` module will be an alias to the `Something` module.
+```ocaml
+(* export = Something *)
+module Export = Something
+```
+
+* If ES6 exports `export interface Foo` or  `export { Bar }` are used, the `Export` module will contain the exported modules.
+```ocaml
+module Export : sig
+  (* export interface Foo *)
+  module Foo = Foo
+  (* export { Bar } *)
+  module Bar = Bar
+  (* export { Baz as Buzz } *)
+  module Buzz = Baz
+end
+```
+
+This is why you are advised to use the generated bindings with the following:
+
+```ocaml
+(* This is analogous to `import * as TypeScript from "typescript";` *)
+module TypeScript = Typescript.Export
+```
+
 # Usage
 
 ```bash
 $ ts2ocaml jsoo [options] <inputs..>
 ```
-
-When multiple input files are given, `ts2ocaml` will merge it to one source file.
-
-`ts2ocaml` will *not* resolve imports and exports between input files, so it can result in a broken binding.
-
-We recommend you to **create one binding for each `.d.ts`**. It works in most of the cases, and it is easy to fix when the binding is broken.
 
 > See also [the common options](common_options.md).
 
@@ -821,3 +918,52 @@ let _ = Foo.someMethod (foo ()) 42.0
 ```
 
 A notable example is the `document` variable in DOM (https://github.com/microsoft/TypeScript/blob/main/lib/lib.dom.d.ts).
+
+
+## `--readable-names`
+
+Try to use more readable names instead of `AnonymousInterfaceN`.
+
+* If the anonymous interface is an argument of a function, the name of the argument will be used.
+```typescript
+declare function foo(person: { name: string; age: number }) : void;
+```
+
+```ocaml
+module PersonN : sig
+  type t
+  val get_name: t -> string
+  val set_name: t -> string -> unit
+  val get_age:  t -> float
+  val set_age:  t -> float -> unit
+
+  val create: name:string -> age:float -> unit -> t
+end
+
+val foo: person:PersonN.t -> unit
+```
+
+* If the anonymous interface is the type of a field or the return type of a function, the name of the field/function will be used.
+```typescript
+declare const foo: { name: string };
+
+declare function bar(age: number) : { age: number };
+```
+
+```ocaml
+module FooN : sig
+  type t
+  val get_name: t -> string
+  ...
+end
+
+val get_foo: unit -> FooN.t
+
+module BarN : sig
+  type t
+  val get_age: t -> float
+  ...
+end
+
+val bar: float -> BarN.t
+```

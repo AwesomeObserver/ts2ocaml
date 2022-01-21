@@ -77,13 +77,18 @@ Target.create "YarnInstall" <| fun _ ->
 
 Target.create "Prepare" ignore
 
-Target.create "BuildOnly" <| fun _ ->
-  dotnetExec "fable" $"{srcDir} --sourceMaps --run webpack"
+Target.create "BuildForPublish" <| fun _ ->
+  dotnetExec "fable" $"{srcDir} --sourceMaps --run webpack --mode=production"
+
+Target.create "BuildForTest" <| fun _ ->
+  dotnetExec "fable" $"{srcDir} --sourceMaps --define DEBUG --run webpack --mode=development"
 
 Target.create "Build" ignore
 
 Target.create "Watch" <| fun _ ->
-  dotnetExec "fable" $"watch {srcDir} --sourceMaps --define DEBUG --run webpack -w"
+  dotnetExec "fable" $"watch {srcDir} --sourceMaps --define DEBUG --run webpack -w --mode=development"
+
+Target.create "TestComplete" ignore
 
 "Clean"
   ==> "YarnInstall"
@@ -92,7 +97,9 @@ Target.create "Watch" <| fun _ ->
   ==> "Build"
 
 "Prepare"
-  ?=> "BuildOnly"
+  ?=> "BuildForTest"
+  ?=> "TestComplete"
+  ?=> "BuildForPublish"
   ==> "Build"
 
 "Prepare"
@@ -106,6 +113,12 @@ module Test =
     let outputDir = outputDir </> "test_jsoo"
     let srcDir = testDir </> "src"
 
+    let clean () =
+      !! $"{outputDir}/*"
+      ++ $"{srcDir}/*.mli"
+      ++ $"{srcDir}/stub.js"
+      |> Seq.iter Shell.rm
+
     let generateBindings () =
       Directory.create outputDir
 
@@ -117,33 +130,40 @@ module Test =
 
       let packages = [
          // "full" package involving a lot of inheritance
-         "full", !! "node_modules/typescript/lib/typescript.d.ts";
+         "full", !! "node_modules/typescript/lib/typescript.d.ts", [];
 
          // "full" packages involving a lot of dependencies (which includes some "safe" packages)
-         "safe", !! "node_modules/@types/scheduler/tracing.d.ts";
-         "full", !! "node_modules/csstype/index.d.ts";
-         "safe", !! "node_modules/@types/prop-types/index.d.ts";
-         "full", !! "node_modules/@types/react/index.d.ts" ++ "node_modules/@types/react/global.d.ts";
-         "full", !! "node_modules/@types/react-modal/index.d.ts";
+         "safe", !! "node_modules/@types/scheduler/tracing.d.ts", [];
+         "full", !! "node_modules/csstype/index.d.ts", [];
+         "safe", !! "node_modules/@types/prop-types/index.d.ts", ["--rec-module=off"];
+         "full", !! "node_modules/@types/react/index.d.ts" ++ "node_modules/@types/react/global.d.ts", ["--readable-names"];
+         "full", !! "node_modules/@types/react-modal/index.d.ts", ["--readable-names"];
 
          // "safe" package which depends on another "safe" package
-         "safe", !! "node_modules/@types/yargs-parser/index.d.ts";
-         "safe", !! "node_modules/@types/yargs/index.d.ts";
+         "safe", !! "node_modules/@types/yargs-parser/index.d.ts", [];
+         "safe", !! "node_modules/@types/yargs/index.d.ts", ["--rec-module=off"];
+
+         "minimal", !! "node_modules/@types/vscode/index.d.ts", ["--safe-arity=full"; "--readable-names"];
       ]
 
-      for preset, package in packages do
-        ts2ocaml ["jsoo"; "--verbose"; "--nowarn"; $"--preset {preset}"; $"-o {outputDir}"] package
+      for preset, package, additionalOptions in packages do
+        ts2ocaml
+          (["jsoo"; "--verbose"; "--nowarn"; "--follow-relative-references";
+            $"--preset {preset}"; $"-o {outputDir}"] @ additionalOptions)
+          package
 
     let build () =
       for file in outputDir |> Shell.copyRecursiveTo true srcDir do
         printfn "* copied to %s" file
       inDirectory testDir <| fun () -> dune "build"
 
+Target.create "TestJsooClean" <| fun _ -> Test.Jsoo.clean ()
 Target.create "TestJsooGenerateBindings" <| fun _ -> Test.Jsoo.generateBindings ()
 Target.create "TestJsooBuild" <| fun _ -> Test.Jsoo.build ()
 Target.create "TestJsoo" ignore
 
-"BuildOnly"
+"BuildForTest"
+  ==> "TestJsooClean"
   ==> "TestJsooGenerateBindings"
   ==> "TestJsooBuild"
   ==> "TestJsoo"
@@ -153,9 +173,8 @@ Target.create "TestOnly" ignore
 
 "TestJsoo"
   ==> "TestOnly"
+  ==> "TestComplete"
   ==> "Test"
-
-"Build" ==> "Test"
 
 // Publish targets
 
@@ -214,7 +233,7 @@ Target.create "PublishJsoo" <| fun _ ->
   Publish.Jsoo.updateVersion ()
   Publish.Jsoo.testBuild ()
 
-"BuildOnly"
+"BuildForPublish"
   ==> "PublishNpm"
   ==> "PublishJsoo"
   ==> "PublishOnly"
@@ -222,7 +241,7 @@ Target.create "PublishJsoo" <| fun _ ->
 
 "TestJsoo" ==> "PublishJsoo"
 
-"Build" ==> "Publish"
+"Build" ?=> "Test" ?=> "Publish"
 
 Target.create "All" ignore
 

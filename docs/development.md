@@ -5,18 +5,24 @@ Overview for Developers
 
 Modules with **\[\<AutoOpen\>\]** does not require `open` to use.
 
-- `src/`
-  - `Bindings/` ... bindings to JS libraries
+- `lib/` ... target-agnostic part of the tool (will be separated to a different repo in near future)
+  - `Bindings/` ... bindings to JS libraries (typescript, browser-or-node)
   - `Extensions.fs` ... **\[\<AutoOpen\>\]** extensions for standard library and JS libraries
   - `DataTypes/`  ... common data structures and algorithm
     - `Text.fs`  ... efficient rope with `O(1)` concat & `O(n)` stringify
     - `Trie.fs`  ... trie based on immutable map
     - `Graph.fs` ... graph based on immutable map & graph algorithms
-  - `Common.fs` ... **\[\<AutoOpen\>\]** global command line options, types, and modules
+  - `Common.fs` ... global interfaces
   - `Syntax.fs` ... AST for parsed TypeScAript code
   - `Naming.fs` ... naming helpers
+  - `JsHelper.fs` ... helper functions for JavaScript-related things e.g. NPM packages and ES6 module names.
+  - `TypeScriptHelper.fs` ... helper functions for using TypeScript Compiler API
   - `Typer.fs`  ... functions for resolving and manipulating AST
   - `Parser.fs` ... functions for converting TS syntax tree to our AST
+- `src/` ... target-dependent part of the tool
+  - `Bindings/` ... bindings to JS libraries (yargs)
+  - `Extensions.fs` ... **\[\<AutoOpen\>\]** extensions for standard library and JS libraries
+  - `Common.fs` ... **\[\<AutoOpen\>\]** global command line options, types, and modules
   - `Target.fs` ... generic definitions for each targets (`ITarget<_>`)
   - `Targets/`  ... targets should be placed into here
     - `ParserTest.fs` ... debug target to test parser and typer
@@ -36,16 +42,21 @@ Modules with **\[\<AutoOpen\>\]** does not require `open` to use.
 
 - [.NET SDK 5.0](https://dotnet.microsoft.com/download/dotnet/5.0)
   - [FAKE](https://fake.build/) and [Fable](https://fable.io/) are required to build this tool.
-    - Run `dotnet tool restore` in the root directory of this repo to install them.
+  - Run `dotnet tool restore` in the root directory of this repo to install them.
 
 - OCaml 4.08 or higher
   - [js_of_ocaml](https://github.com/ocsigen/js_of_ocaml) should be installed to your opam switch.
-  - The latest [gen_js_api](https://github.com/LexiFi/gen_js_api) should also be installed to your opam switch.
-    - As of Oct 2021, most of the required features have not been present in the latest version in opam.
-    - You should install the latest version by `opam pin add gen_js_api https://github.com/LexiFi/gen_js_api.git`
+  - [gen_js_api](https://github.com/LexiFi/gen_js_api) `>= 1.0.9` should also be installed to your opam switch.
+  - Run `opam install . --deps-only` to install all the dependencies.
 
 - Node 14.0 or higher
   - [yarn](https://yarnpkg.com/) is required.
+
+## Debugging
+
+`dotnet fake build -t Watch` to live update `dist/ts2ocaml.js`.
+
+It will be bundled by Webpack with the `development` mode.
 
 ## Building
 

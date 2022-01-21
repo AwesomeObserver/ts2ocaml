@@ -1,5 +1,6 @@
 module Targets.JsOfOCaml.Writer
 
+open Ts2Ml
 open Syntax
 open Typer
 open Typer.Type
@@ -12,15 +13,18 @@ open Targets.JsOfOCaml.OCamlHelper
 type ScriptTarget = TypeScript.Ts.ScriptTarget
 
 type State = {|
+  fileNames: string list
+  info: Result<PackageInfo, string option>
   referencesCache: MutableMap<string list, WeakTrie<string>>
-  usedAnonymousInterfacesCache: MutableMap<string list, Set<int>>
 |}
 module State =
-  let create () : State =
-    {| referencesCache = new MutableMap<_, _>();
-       usedAnonymousInterfacesCache = new MutableMap<_, _>() |}
+  let create fileNames info : State =
+    {| fileNames = fileNames
+       info = info
+       referencesCache = new MutableMap<_, _>() |}
 
-type Context = Context<Options, State>
+type Context = TyperContext<Options, State>
+module Context = TyperContext
 
 let emitCommentBody (c: Comment) : text =
   // https://github.com/ocaml/ocaml/issues/5745
@@ -47,7 +51,8 @@ let emitCommentBody (c: Comment) : text =
       str "example:"
       between "[" "]" (strLines (escape lines))
     ]
-  | See (link, lines) -> tprintf "@see \"%s\" " link + strLines (escape lines)
+  | See (Some name, lines) -> tprintf "@see \"%s\" " name + strLines (escape lines)
+  | See (None, lines) -> str "see: " + strLines (escape lines)
   | ESVersion target ->
     match target with
     | ScriptTarget.ES3 | ScriptTarget.ES5 -> empty
@@ -72,7 +77,7 @@ let literalToIdentifier (ctx: Context) (l: Literal) : text =
     |> String.replace "." "_"
   match l with
   | LString s ->
-    match ctx.typeLiteralsMap |> Map.tryFind l with
+    match ctx |> Context.bindCurrentSourceInfo (fun i -> i.typeLiteralsMap |> Map.tryFind l) with
     | Some i ->
       if String.forall (Char.isAlphabetOrDigit >> not) s then tprintf "s%i" i
       else tprintf "s%i_%s" i (formatString s)
@@ -81,17 +86,32 @@ let literalToIdentifier (ctx: Context) (l: Literal) : text =
   | LFloat l -> tprintf "n_%s" (formatNumber l)
   | LBool true -> str "b_true" | LBool false -> str "b_false"
 
-let anonymousInterfaceModuleName (index: int) = sprintf "AnonymousInterface%d" index
+let anonymousInterfaceModuleName (ctx: Context) (info: AnonymousInterfaceInfo) =
+  match info.origin.valueName, info.origin.argName with
+  | _, Some s | Some s, None when ctx.options.readableNames ->
+    sprintf "%s%d" (Naming.toCase Naming.PascalCase s) info.id
+  | _, _ ->
+    sprintf "AnonymousInterface%d" info.id
 
-let anonymousInterfaceToIdentifier (ctx: Context) (c: Class) : text =
-  match ctx.anonymousInterfacesMap |> Map.tryFind c, c.name with
-  | Some i, None ->
+let anonymousInterfaceToIdentifier (ctx: Context) (a: AnonymousInterface) : text =
+  match ctx |> Context.bindCurrentSourceInfo (fun i -> i.anonymousInterfacesMap |> Map.tryFind a) with
+  | Some i ->
     if not ctx.options.recModule.IsOffOrDefault then
-      tprintf "%s.t" (anonymousInterfaceModuleName i)
+      tprintf "%s.t" (anonymousInterfaceModuleName ctx i)
     else
-      tprintf "anonymous_interface_%d" i
-  | None, None -> failwithf "the anonymous interface '%A' is not found in the context" c
-  | _, Some n -> failwithf "the class or interface '%s' is not anonymous" n
+      tprintf "anonymous_interface_%d" i.id
+  | None -> failwithf "impossible_anonymousInterfaceToIdentifier(%s)" a.loc.AsString
+
+let enumCaseToIdentifier (e: Enum) (c: EnumCase) =
+  let duplicateCases =
+    e.cases |> List.filter (fun c' -> c.value = c'.value)
+  match duplicateCases with
+  | [] -> failwith "impossible_enumCaseToIdentifier"
+  | [c'] ->
+    assert (c = c')
+    Naming.constructorName [c.name]
+  | cs ->
+    cs |> List.map (fun c -> c.name) |> Naming.constructorName
 
 type Variance = Covariant | Contravariant | Invariant with
   static member (~-) (v: Variance) =
@@ -144,13 +164,21 @@ module OverrideFunc =
 let rec emitTypeImpl (flags: EmitTypeFlags) (overrideFunc: OverrideFunc) (ctx: Context) (ty: Type) : text =
   let forceSkipAttr text =
     if flags.forceSkipAttributes then empty else text
-  let treatEnum (flags: EmitTypeFlags) ctx (cases: Set<Choice<EnumCase, Literal>>) =
+  let treatEnum (flags: EmitTypeFlags) ctx (cases: Set<Choice<Enum * EnumCase, Literal>>) =
+    let usedValues =
+      cases
+      |> Seq.choose (function Choice1Of2 (_, { value = v }) -> v | _ -> None)
+      |> Set.ofSeq
+    let cases =
+      cases
+      // Remove literal cases (e.g. `42`) when it is a duplicate of some enum case (e.g. `Case = 42`).
+      |> Set.filter (function Choice2Of2 l when usedValues |> Set.contains l -> false | _ -> true)
+      // Convert to identifiers while merging duplicate enum cases
+      |> Set.map (function
+        | Choice1Of2 (e, c) -> enumCaseToIdentifier e c |> str, c.value
+        | Choice2Of2 l -> "L_" @+ literalToIdentifier ctx l, Some l)
     between "[" "]" (concat (str " | ") [
-      for c in Set.toSeq cases do
-        let name, value =
-          match c with
-          | Choice1Of2 e -> str (Naming.constructorName [e.name]), e.value
-          | Choice2Of2 l -> "L_" @+ literalToIdentifier ctx l, Some l
+      for name, value in Set.toSeq cases do
         let attr =
           match value with
           | _ when flags.forceSkipAttributes -> empty
@@ -159,11 +187,20 @@ let rec emitTypeImpl (flags: EmitTypeFlags) (overrideFunc: OverrideFunc) (ctx: C
         yield pv_head @+ name + attr
     ]) + forceSkipAttr (str " [@js.enum]") |> between "(" ")"
 
-  let treatIdent { name = name; fullName = fno; loc = identLoc } (tyargs: Type list) (loc: Location) =
+  let treatIdent (i: Ident) (tyargs: Type list) (loc: Location) =
     let arity = List.length tyargs
     let withTyargs ty =
       Type.appOpt ty (tyargs |> List.map (emitTypeImpl { flags with needParen = true; forceVariadic = false } overrideFunc ctx))
-    match fno with
+    let origin =
+      Ident.pickDefinitionWithFullName ctx i (fun fn -> function
+        | _ when fn.source <> ctx.currentSourceFile -> None
+        | Definition.Class     { typeParams = tps; loc = loc }
+        | Definition.TypeAlias { typeParams = tps; loc = loc } -> Some (fn, tps, loc)
+        | Definition.Enum { loc = loc }
+        | Definition.EnumCase ({ loc = loc }, _) -> Some (fn, [], loc)
+        | _ -> None
+      )
+    match origin with
     | None ->
       let tyName =
         let fallback () =
@@ -172,38 +209,43 @@ let rec emitTypeImpl (flags: EmitTypeFlags) (overrideFunc: OverrideFunc) (ctx: C
             | FeatureFlag.Full | FeatureFlag.Consume ->
               Naming.createTypeNameOfArity arity None "t"
             | _ -> "t"
-          Naming.structured Naming.moduleName name + "." + tyName |> str
-        match name with
+          Naming.structured Naming.moduleName i.name + "." + tyName |> str
+        match i.name with
         | [name] ->
           match PrimType.FromJSClassName name with
           | Some p -> emitTypeImpl flags overrideFunc ctx (Prim p)
           | None -> fallback ()
         | _ -> fallback ()
       tyName |> withTyargs
-    | Some fn ->
-      if not ctx.options.recModule.IsOffOrDefault then
-        let maxArity =
-          FullName.tryLookupWith ctx fn (function
-            | AliasName { typeParams = tps }
-            | ClassName { typeParams = tps } -> List.length tps |> Some
-            | _ -> None
-          )
-        let tyName = Naming.createTypeNameOfArity arity maxArity "t"
-        match ctx |> Context.getRelativeNameTo fn with
-        | Ok relativeName ->
-          assert (relativeName = name)
-          Naming.structured Naming.moduleName relativeName + "." + tyName |> str |> withTyargs
-        | Error diff ->
-          if List.isEmpty diff then
-            // the type is the current namespace
+    | Some (fn, typrms, origLoc) ->
+      if ctx.options.recModule.IsOffOrDefault then
+        let name = Naming.flattenedTypeName fn.name
+        let ts =
+          assignTypeParams fn.name (origLoc ++ loc) typrms tyargs
+            (fun _ t -> t)
+            (fun tv ->
+              match tv.defaultType with
+              | Some t -> t
+              | None -> failwithf "error: insufficient type params for type '%s' at %s" (String.concat "." fn.name) loc.AsString)
+        Type.appOpt (str name) (ts |> List.map (emitTypeImpl { flags with needParen = true; forceVariadic = false  } overrideFunc ctx))
+      else
+        let maxArity = List.length typrms
+        let tyName = Naming.createTypeNameOfArity arity (Some maxArity) "t"
+        let simple name =
+          Naming.structured Naming.moduleName name + "." + tyName |> str |> withTyargs
+        if fn.source <> ctx.currentSourceFile then simple fn.name
+        else
+          match ctx |> Context.getRelativeNameTo fn.name with
+          | Ok relativeName -> simple relativeName
+          | Error [] -> // the type is the current namespace
             tyName |> str |> withTyargs
-          else
+          | Error diff ->
             if ctx.options.subtyping |> List.contains Subtyping.Tag then
               // the type is a parent of the current namespace.
               // we expand the identifier to `[ .. ] intf`
               let ty =
-                if List.isEmpty tyargs then Ident { name = name; fullName = fno; loc = loc }
-                else App (AIdent { name = name; fullName = fno; loc = identLoc }, tyargs, loc)
+                if List.isEmpty tyargs then Ident i
+                else App (AIdent i, tyargs, loc)
               let labels =
                 getAllInheritancesAndSelf ctx ty
                 |> getLabelsFromInheritingTypes (emitTypeImpl flags overrideFunc) ctx
@@ -211,27 +253,11 @@ let rec emitTypeImpl (flags: EmitTypeFlags) (overrideFunc: OverrideFunc) (ctx: C
               |> List.singleton
               |> Type.app Type.intf
             else
-              let fn = String.concat "." fn
+              let fn = String.concat "." fn.name
               let selfName = String.concat "." diff
               let warnText = $"cannot reference a type {fn} from its sub-namespace {selfName}"
               Log.warnf ctx.options "%s at %s" warnText loc.AsString
               commentStr warnText + Type.any
-      else
-        let name = Naming.flattenedTypeName fn
-        let ts =
-          FullName.tryLookupWith ctx fn (function
-            | AliasName { typeParams = tps; loc = origLoc }
-            | ClassName { typeParams = tps; loc = origLoc } ->
-              assignTypeParams fn (origLoc ++ loc) tps tyargs
-                (fun _ t -> t)
-                (fun tv ->
-                  match tv.defaultType with
-                  | Some t -> t
-                  | None -> failwithf "error: insufficient type params for type '%s' at %s" (String.concat "." fn) loc.AsString)
-              |> Some
-            | _ -> None
-          ) |> Option.defaultValue tyargs
-        Type.appOpt (str name) (ts |> List.map (emitTypeImpl { flags with needParen = true; forceVariadic = false  } overrideFunc ctx))
 
   match overrideFunc (emitTypeImpl flags overrideFunc) ctx ty with
   | Some t -> t
@@ -290,14 +316,14 @@ let rec emitTypeImpl (flags: EmitTypeFlags) (overrideFunc: OverrideFunc) (ctx: C
           | true, false -> Type.app Type.null_ [t]
           | false, true -> Type.app Type.undefined [t]
           | false, false -> t
-        let treatTypeofableTypes (ts: Set<TypeofableType>) t =
+        let treatTypeofableTypes (ts: Set<Typeofable>) t =
           let emitOr tt t =
             match tt with
-            | TNumber -> Type.number_or t
-            | TString -> Type.string_or t
-            | TBoolean -> Type.boolean_or t
-            | TSymbol -> Type.symbol_or t
-            | TBigInt -> Type.bigint_or t
+            | Typeofable.Number -> Type.number_or t
+            | Typeofable.String -> Type.string_or t
+            | Typeofable.Boolean -> Type.boolean_or t
+            | Typeofable.Symbol -> Type.symbol_or t
+            | Typeofable.BigInt -> Type.bigint_or t
           let rec go = function
             | [] -> t
             | [x] ->
@@ -328,7 +354,7 @@ let rec emitTypeImpl (flags: EmitTypeFlags) (overrideFunc: OverrideFunc) (ctx: C
             failwith "impossible_emitResolvedUnion_treatOther_go"
           else
             otherTypes |> Set.toList |> List.map (emitTypeImpl flags overrideFunc ctx) |> safe_union_t
-        let treatEnumOr (cases: Set<Choice<EnumCase, Literal>>) t =
+        let treatEnumOr (cases: Set<Choice<Enum * EnumCase, Literal>>) t =
           if Set.isEmpty cases then t
           else Type.enum_or (treatEnum flags ctx cases) t
         let treatDUMany du =
@@ -359,7 +385,7 @@ let rec emitTypeImpl (flags: EmitTypeFlags) (overrideFunc: OverrideFunc) (ctx: C
     | AnonymousInterface a -> anonymousInterfaceToIdentifier ctx a
     | PolymorphicThis -> commentStr "FIXME: polymorphic this" + Type.any
     | Intrinsic -> Type.ojs_t
-    | Function f ->
+    | Func (f, [], _) ->
       let renamer = new OverloadRenamer(used=(flags.avoidTheseArgumentNames |> Set.map (fun s -> "value", s)))
       let inline rename x = renamer.Rename "value" x
       // warning 16 (this optional argument cannot be erased) is widened since OCaml 4.12:
@@ -400,7 +426,7 @@ let rec emitTypeImpl (flags: EmitTypeFlags) (overrideFunc: OverrideFunc) (ctx: C
           f.args |> List.choose (function Choice1Of2 x -> Some x.name | Choice2Of2 _ -> None) |> Set.ofList
         let x = emitTypeImpl { flags with needParen = false; avoidTheseArgumentNames = argNames } overrideFunc ctx f.returnType
         match f.returnType with
-        | Function _ -> between "(" ")" (x + forceSkipAttr (str " [@js.dummy]"))
+        | Func _ -> between "(" ")" (x + forceSkipAttr (str " [@js.dummy]"))
         | _ -> x
       let result = lhs +@ " -> " + rhs
       if flags.needParen then result |> between "(" ")" else result
@@ -411,6 +437,8 @@ let rec emitTypeImpl (flags: EmitTypeFlags) (overrideFunc: OverrideFunc) (ctx: C
       | [t] -> emitTypeImpl flags overrideFunc ctx t.value
       | ts  -> Type.tuple (ts |> List.map (fun x -> emitTypeImpl flags overrideFunc ctx x.value))
     | Erased (_, loc, origText) -> failwithf "impossible_emitTypeImpl_erased: %s (%s)" loc.AsString origText
+    | Func (_, _ :: _, loc) -> failwithf "impossible_emitTypeImpl_Func_poly: %s (%s)" loc.AsString (Type.pp ty)
+    | NewableFunc (_, _, loc) -> failwithf "impossible_emitTypeImpl_NewableFunc: %s (%s)" loc.AsString (Type.pp ty)
     | UnknownType msgo ->
       match msgo with None -> commentStr "FIXME: unknown type" + Type.any | Some msg -> commentStr (sprintf "FIXME: unknown type '%s'" msg) + Type.any
 
@@ -456,9 +484,7 @@ and getLabelsFromInheritingTypes (emitType_: TypeEmitter) (ctx: Context) (inheri
     for e in inheritingTypes do
       match e with
       | InheritingType.KnownIdent i ->
-        yield str pv_head + emitCase i.fullName (i.tyargs |> List.map (emitType_ ctx)) |> Case
-      | InheritingType.ImportedIdent i ->
-        yield emitTagType i.name i.tyargs |> TagType
+        yield str pv_head + emitCase i.fullName.name (i.tyargs |> List.map (emitType_ ctx)) |> Case
       | InheritingType.UnknownIdent i ->
         yield emitTagType i.name i.tyargs |> TagType
       | InheritingType.Prim (p, ts) ->
@@ -470,16 +496,16 @@ and getLabelsFromInheritingTypes (emitType_: TypeEmitter) (ctx: Context) (inheri
   ]
 
 /// `Choice2Of2` when it is an alias to a non-JSable prim type.
-and getLabelsOfFullName emitType_ (ctx: Context) (fullName: string list) (typeParams: TypeParam list) =
+and getLabelsOfFullName emitType_ (ctx: Context) (fullName: FullName) (typeParams: TypeParam list) =
   let normalClass () = getAllInheritancesAndSelfFromName ctx fullName |> getLabelsFromInheritingTypes emitType_ ctx
-  match fullName with
+  match fullName.name with
   | [name] when ctx.options.stdlib && Map.containsKey name Type.nonJsablePrimTypeInterfaces && typeParams |> List.isEmpty ->
     let prim = Type.nonJsablePrimTypeInterfaces |> Map.find name
     Choice2Of2 (prim, Case (tprintf "%s%s" pv_head name))
   | _ -> Choice1Of2 (normalClass () |> List.sort)
 
-and getLabelOfFullName emitType_ (ctx: Context) fullName (typeParams: TypeParam list) =
-  match fullName with
+and getLabelOfFullName emitType_ (ctx: Context) (fullName: FullName) (typeParams: TypeParam list) =
+  match fullName.name with
   | [name] when ctx.options.stdlib && Map.containsKey name Type.nonJsablePrimTypeInterfaces && typeParams |> List.isEmpty ->
     let prim = Type.nonJsablePrimTypeInterfaces |> Map.find name
     Choice2Of2 (prim, Case (tprintf "%s%s" pv_head name))
@@ -493,15 +519,12 @@ type StructuredTextItem =
   | ScopeIndependent of text
   | OverloadedText of (OverloadRenamer -> text list)
 
-type ExportWithKind = {|
-  comments: Comment list
-  clause: ExportClause
-  loc: Location
-  origText: string
-  kind: Set<Kind>
-|}
+type [<RequireQualifiedAccess>] ExportItem =
+  | Export of {| comments: Comment list; clauses: (ExportClause * Set<Kind>) list; loc: Location; origText: string |}
+  | ReExport of {| comments: Comment list; clauses: (ReExportClause * Set<Kind>) list; loc: Location; specifier: string; origText: string |}
+  | DefaultUnnamedClass of StructuredTextNode
 
-type [<RequireQualifiedAccess>] Scoped =
+and [<RequireQualifiedAccess>] Scoped =
   | Force of string
   | Yes
   | No
@@ -514,22 +537,24 @@ with
     | Force s, _ | _, Force s -> Force s
     | Yes, _ | _, Yes -> Yes
 
-type StructuredTextNode = {|
+and StructuredTextNode = {|
   scoped: Scoped
   items: StructuredTextItem list
   docCommentLines: text list
-  exports: ExportWithKind list
+  exports: ExportItem list
   knownTypes: Set<KnownType>
+  anonymousInterfaces: Set<AnonymousInterface>
 |}
 module StructuredTextNode =
   let empty : StructuredTextNode =
-    {| scoped = Scoped.No; items = []; docCommentLines = []; exports = []; knownTypes = Set.empty |}
+    {| scoped = Scoped.No; items = []; docCommentLines = []; exports = []; knownTypes = Set.empty; anonymousInterfaces = Set.empty |}
   let union (a: StructuredTextNode) (b: StructuredTextNode) : StructuredTextNode =
     {| scoped = Scoped.union a.scoped b.scoped
        items = List.append a.items b.items
        docCommentLines = List.append a.docCommentLines b.docCommentLines
        exports = List.append a.exports b.exports
-       knownTypes = Set.union a.knownTypes b.knownTypes |}
+       knownTypes = Set.union a.knownTypes b.knownTypes
+       anonymousInterfaces = Set.union a.anonymousInterfaces b.anonymousInterfaces |}
 
 type StructuredText = Trie<string, StructuredTextNode>
 
@@ -547,15 +572,16 @@ module StructuredText =
     match ctx.state.referencesCache.TryGetValue(ctx.currentNamespace) with
     | true, ts -> ts
     | false, _ ->
-      let fn = List.rev ctx.currentNamespace
+      let fn = ctx.currentNamespace
       let trie =
         x.value
         |> Option.map (fun v ->
           v.knownTypes
           |> Set.fold (fun state -> function
-            | KnownType.Ident ks -> state |> WeakTrie.add ks
-            | KnownType.AnonymousInterface i ->
-              state |> WeakTrie.add [anonymousInterfaceModuleName i]
+            | KnownType.Ident fn when fn.source = ctx.currentSourceFile -> state |> WeakTrie.add fn.name
+            | KnownType.AnonymousInterface (_, i) ->
+              state |> WeakTrie.add (i.namespace_ @ [anonymousInterfaceModuleName ctx i])
+            | _ -> state
           ) WeakTrie.empty)
         |> Option.defaultValue WeakTrie.empty
       let trie =
@@ -567,7 +593,7 @@ module StructuredText =
       trie
 
   let getDependenciesOfChildren (ctx: Context) (x: StructuredText) : (string * string) list =
-    let parent = List.rev ctx.currentNamespace
+    let parent = ctx.currentNamespace
     x.children
     |> Map.fold (fun state k child ->
       let refs =
@@ -578,7 +604,7 @@ module StructuredText =
         |> WeakTrie.toList
         |> List.map (function
           | [x] -> k, x
-          | xs -> failwithf "impossible_StructuredText_getDependencyGraphOfChildren_refs(%s): %A" (k :: ctx.currentNamespace |> List.rev |> String.concat ".") xs)
+          | xs -> failwithf "impossible_StructuredText_getDependencyGraphOfChildren_refs(%s): %A" (ctx |> Context.getFullNameString [k]) xs)
       refs :: state) []
     |> List.rev
     |> List.concat
@@ -592,7 +618,9 @@ module StructuredText =
 let removeLabels (xs: Choice<FieldLike, Type> list) =
     xs |> List.map (function Choice2Of2 t -> Choice2Of2 t | Choice1Of2 fl -> Choice2Of2 fl.value)
 
-let rec emitMembers (emitType_: TypeEmitter) ctx (name: string) (selfTy: Type) (ma: MemberAttribute) m = [
+let inline func ft = Func (ft, [], ft.loc)
+
+let rec emitMembers (emitType_: TypeEmitter) ctx (selfTy: Type) (ma: MemberAttribute) m = [
   let inline comments () =
     match ma.comments with
     | [] -> Seq.empty
@@ -606,29 +634,29 @@ let rec emitMembers (emitType_: TypeEmitter) ctx (name: string) (selfTy: Type) (
     OverloadedText (fun renamer -> f (renamer.Rename "value"))
 
   match m with
-  | Constructor (ft, typrm) ->
-    let ty = Function { args = ft.args; isVariadic = ft.isVariadic; returnType = selfTy; loc = ft.loc } |> emitType_ ctx
+  | Constructor ft ->
+    let ty = func { args = ft.args; isVariadic = ft.isVariadic; returnType = selfTy; loc = ft.loc } |> emitType_ ctx
     yield! comments ()
     yield overloaded (fun rename -> [val_ (rename "create") ty + str " " + Attr.js_create])
-  | New (ft, typrm) ->
-    let ft = Function { ft with args = Choice2Of2 selfTy :: ft.args } |> emitType_ ctx
+  | Newable (ft, _typrm) ->
+    let ft = func { ft with args = Choice2Of2 selfTy :: ft.args } |> emitType_ ctx
     yield! comments ()
     yield overloaded (fun rename -> [val_ (rename "create") ft + str " " + Attr.js_apply true])
-  | Field ({ name = name; value = Function ft }, _, typrm)
-  | Method (name, ft, typrm) ->
+  | Field ({ name = name; value = Func (ft, _typrm, _) }, _)
+  | Method (name, ft, _typrm) ->
     let ty, attr =
-      if ma.isStatic then Function ft, Attr.js_global name
+      if ma.isStatic then func ft, Attr.js_global name
       else
         let ft = { ft with args = Choice2Of2 PolymorphicThis :: ft.args }
-        Function ft, Attr.js_call name
+        func ft, Attr.js_call name
     let ty = emitType_ ctx ty
     yield! comments ()
     yield overloaded (fun rename -> [val_ (Naming.valueName name |> rename) ty + str " " + attr])
-  | Getter fl | Field (fl, ReadOnly, _) ->
+  | Getter fl | Field (fl, ReadOnly) ->
     let fl =
       if fl.value <> Prim Void then fl
       else
-        Log.warnf ctx.options "the field/getter '%s' of type '%s' has type 'void' and treated as 'unknown'" fl.name name
+        ctx.logger.warnf "the field/getter '%s' at %s has type 'void' and treated as 'unknown'" fl.name ma.loc.AsString
         { fl with value = Prim Unknown }
     let ty =
       let args =
@@ -637,36 +665,36 @@ let rec emitMembers (emitType_: TypeEmitter) ctx (name: string) (selfTy: Type) (
       let ret =
         if fl.isOptional then Union { types = [fl.value; Prim Undefined] }
         else fl.value
-      Function { isVariadic = false; args = args; returnType = ret; loc = ma.loc } |> emitType_ ctx
+      func { isVariadic = false; args = args; returnType = ret; loc = ma.loc } |> emitType_ ctx
     yield! comments ()
     yield overloaded (fun rename -> [val_ ("get_" + Naming.removeInvalidChars fl.name |> rename) ty + str " " + Attr.js_get fl.name])
-  | Setter fl | Field (fl, WriteOnly, _) ->
+  | Setter fl | Field (fl, WriteOnly) ->
     let fl =
       if fl.value <> Prim Void then fl
       else
-        Log.warnf ctx.options "the field/setter '%s' of type '%s' has type 'void' and treated as 'unknown'" fl.name name
+        ctx.logger.warnf "the field/setter '%s' at '%s' has type 'void' and treated as 'unknown'" fl.name ma.loc.AsString
         { fl with value = Prim Unknown }
     let ty =
       let args =
         if ma.isStatic then [Choice2Of2 fl.value]
         else [Choice2Of2 PolymorphicThis; Choice2Of2 fl.value]
-      Function { isVariadic = false; args = args; returnType = Prim Void; loc = ma.loc } |> emitType_ ctx
+      func { isVariadic = false; args = args; returnType = Prim Void; loc = ma.loc } |> emitType_ ctx
     yield! comments ()
     yield overloaded (fun rename -> [val_ ("set_" + Naming.removeInvalidChars fl.name |> rename) ty + str " " + Attr.js_set fl.name])
-  | Field (fl, Mutable, _) ->
-    yield! emitMembers emitType_ ctx name selfTy ma (Getter fl)
-    yield! emitMembers emitType_ ctx name selfTy ma (Setter fl)
-  | FunctionInterface (ft, _) ->
-    let ft = Function { ft with args = Choice2Of2 PolymorphicThis :: ft.args } |> emitType_ ctx
+  | Field (fl, Mutable) ->
+    yield! emitMembers emitType_ ctx selfTy ma (Getter fl)
+    yield! emitMembers emitType_ ctx selfTy ma (Setter fl)
+  | Callable (ft, _typrm) ->
+    let ft = func { ft with args = Choice2Of2 PolymorphicThis :: ft.args } |> emitType_ ctx
     yield! comments ()
     yield overloaded (fun rename -> [val_ (rename "apply") ft + str " " + Attr.js_apply false])
   | Indexer (ft, ReadOnly) ->
-    let ft = Function { ft with args = Choice2Of2 PolymorphicThis :: removeLabels ft.args } |> emitType_ ctx
+    let ft = Func ({ ft with args = Choice2Of2 PolymorphicThis :: removeLabels ft.args }, [], ft.loc) |> emitType_ ctx
     yield! comments ()
     yield overloaded (fun rename -> [val_ (rename "get") ft + str " " + Attr.js_index_get])
   | Indexer (ft, WriteOnly) ->
     let ft =
-      Function {
+      func {
         args = Choice2Of2 PolymorphicThis :: removeLabels ft.args @ [ Choice2Of2 ft.returnType ]
         isVariadic = false;
         returnType = Prim Void;
@@ -675,9 +703,11 @@ let rec emitMembers (emitType_: TypeEmitter) ctx (name: string) (selfTy: Type) (
     yield! comments ()
     yield overloaded (fun rename -> [val_ (rename "set") ft + str " " + Attr.js_index_set])
   | Indexer (ft, Mutable) ->
-    yield! emitMembers emitType_ ctx name selfTy ma (Indexer (ft, ReadOnly))
-    yield! emitMembers emitType_ ctx name selfTy ma (Indexer (ft, WriteOnly))
-  | SymbolIndexer _ -> ()
+    yield! emitMembers emitType_ ctx selfTy ma (Indexer (ft, ReadOnly))
+    yield! emitMembers emitType_ ctx selfTy ma (Indexer (ft, WriteOnly))
+  | SymbolIndexer (symbol, ft, _) ->
+    let ft = func ft |> emitType_ ctx
+    yield comment (tprintf "[Symbol.%s]: " symbol + ft) |> ScopeIndependent
   | UnknownMember msgo ->
     yield! comments ()
     match msgo with
@@ -686,18 +716,19 @@ let rec emitMembers (emitType_: TypeEmitter) ctx (name: string) (selfTy: Type) (
     | None -> ()
 ]
 
-let emitMappers ctx emitType tName (typrms: TypeParam list) =
-  let t_ident =
-    { name = [tName]; fullName = Some [tName]; loc = UnknownLocation }
+let emitMappers (ctx: Context) emitType tName (typrms: TypeParam list) =
+  let t =
+    { name = [tName]; fullName = []; kind = None; loc = UnknownLocation; parent = None }
   let t_ty =
-    if List.isEmpty typrms then Ident t_ident
-    else App (AIdent t_ident, typrms |> List.map (fun typrm -> TypeVar typrm.name), UnknownLocation)
-  let ojs_t_ty = Ident { name = ["Ojs"; "t"]; fullName = Some ["Ojs"; "t"]; loc = UnknownLocation }
+    if List.isEmpty typrms then Ident t
+    else App (AIdent t, typrms |> List.map (fun typrm -> TypeVar typrm.name), UnknownLocation)
+  let ojs_t = { name = ["Ojs"; "t"]; fullName = []; kind = None; loc = UnknownLocation; parent = None }
+  let ojs_t_ty = Ident ojs_t
   let orf _emitType _ctx ty =
     match ty with
-    | Ident { name = ["Ojs"; "t"] } -> Some (str "Ojs.t")
-    | Ident i when i = t_ident -> Some (str tName)
-    | App (AIdent i, ts, _) when i = t_ident ->
+    | Ident i when i = ojs_t -> Some (str "Ojs.t")
+    | Ident i when i = t     -> Some (str tName)
+    | App (AIdent i, ts, _) when i = t ->
       Type.app (str tName) (ts |> List.map (_emitType _ctx)) |> Some
     | _ -> None
   let emitType_ = emitType orf
@@ -705,14 +736,14 @@ let emitMappers ctx emitType tName (typrms: TypeParam list) =
     let mapperArgs =
       typrms |> List.map (fun typrm ->
         if toJs then
-          Function { args = [Choice2Of2 (TypeVar typrm.name)]; returnType = ojs_t_ty; isVariadic = false; loc = UnknownLocation } |> Choice2Of2
+          func { args = [Choice2Of2 (TypeVar typrm.name)]; returnType = ojs_t_ty; isVariadic = false; loc = UnknownLocation } |> Choice2Of2
         else
-          Function { args = [Choice2Of2 ojs_t_ty]; returnType = TypeVar typrm.name; isVariadic = false; loc = UnknownLocation } |> Choice2Of2
+          func { args = [Choice2Of2 ojs_t_ty]; returnType = TypeVar typrm.name; isVariadic = false; loc = UnknownLocation } |> Choice2Of2
       )
     if toJs then
-      Function { args = mapperArgs @ [Choice2Of2 t_ty]; returnType = ojs_t_ty; isVariadic = false; loc = UnknownLocation }
+      func { args = mapperArgs @ [Choice2Of2 t_ty]; returnType = ojs_t_ty; isVariadic = false; loc = UnknownLocation }
     else
-      Function { args = mapperArgs @ [Choice2Of2 ojs_t_ty]; returnType = t_ty; isVariadic = false; loc = UnknownLocation }
+      func { args = mapperArgs @ [Choice2Of2 ojs_t_ty]; returnType = t_ty; isVariadic = false; loc = UnknownLocation }
   [
     val_ (sprintf "%s_to_js" tName) (emitType_ ctx (funTy true))  |> ScopeIndependent
     val_ (sprintf "%s_of_js" tName) (emitType_ ctx (funTy false)) |> ScopeIndependent
@@ -777,47 +808,79 @@ module GetSelfTyText =
     let emitType_ = emitType overrideFunc
     let fallback = str "private Ojs.t"
     match c.name with
-    | Some name ->
-      assert (name = List.head ctx.currentNamespace)
-
+    | Name name ->
+      assert (name = List.last ctx.currentNamespace)
       if ctx.options.subtyping |> List.contains Subtyping.Tag then
         let labels =
-          getLabelsOfFullName emitType_ ctx (List.rev ctx.currentNamespace) c.typeParams
+          getLabelsOfFullName emitType_ ctx (ctx |> Context.getFullName []) c.typeParams
           |> function Choice1Of2 xs -> xs | Choice2Of2 (_, x) -> [x]
         if List.isEmpty labels then fallback
         else
           Type.appOpt Type.intf [emitLabels ctx labels] + str " " + Attr.js_custom_typ (genJsCustomMapper c.typeParams)
       else fallback
-    | None -> fallback
+    | ExportDefaultUnnamedClass ->
+      let labels =
+        c.implements
+        |> List.map (getAllInheritancesAndSelf ctx) |> Set.unionMany
+        |> getLabelsFromInheritingTypes emitType_ ctx
+      if List.isEmpty labels then fallback
+      else
+        Type.appOpt Type.intf [emitLabels ctx labels] + str " " + Attr.js_custom_typ (genJsCustomMapper c.typeParams)
 
-  let enumCases (cases: EnumCase list) =
+  let enumCases (e: Enum) (cases: EnumCase list) =
+    let cases =
+      cases
+      |> List.map (fun c -> enumCaseToIdentifier e c, c.value)
+      |> Set.ofList
     between "[" "]" (concat (str " | ") [
-      for c in cases do
-        let name, value = str (Naming.constructorName [c.name]), c.value
+      for name, value in cases |> Set.toSeq do
         let attr =
           match value with
           | Some v -> Attr.js (Term.literal v)
           | None -> empty
-        yield pv_head @+ name + attr
-      ]) +@ " [@js.enum]"
+        yield pv_head @+ name @+ attr
+    ]) +@ " [@js.enum]"
 
-let getExportFromStatement (ctx: Context) (name: string) (kind: Kind list) (kindString: string) (s: Statement) : ExportWithKind option =
+let getExportFromStatement (ctx: Context) (name: string) (kind: Kind list) (kindString: string) (s: Statement) : ExportItem option =
   let fn = ctx |> Context.getFullName [name]
-  let ident = { name = [name]; fullName = Some fn; loc = s.loc }
+  let ident = { name = [name]; fullName = [fn]; kind = Some (Set.ofList kind); parent = None; loc = s.loc }
   match s.isExported.AsExport ident with
   | None -> None
   | Some clause ->
-    Some {| comments = []; clause = clause; loc = s.loc; origText = sprintf "export %s %s" kindString name; kind = Set.ofList kind |}
+    let prefix =
+      match clause with
+      | ES6DefaultExport _ -> "export default"
+      | _ -> "export"
+    Some (ExportItem.Export {| comments = []; clauses = [clause, Set.ofList kind]; loc = s.loc; origText = sprintf "%s %s %s" prefix kindString name |})
 
-let emitClass flags overrideFunc (ctx: Context) (current: StructuredText) (c: Class) (additionalMembers: Context -> EmitTypeFlags -> OverrideFunc -> list<StructuredTextItem>, additionalKnownTypes: Set<KnownType>, forceScoped: Scoped option) =
+let getTrie name current =
+  current |> Trie.getSubTrie name |> Option.defaultValue Trie.empty
+let setTrie name trie current =
+  current |> Trie.setSubTrie name trie
+let inTrie name f current =
+  let m =
+    current
+    |> Trie.getSubTrie name
+    |> Option.defaultValue Trie.empty
+    |> f
+  current |> Trie.setSubTrie name m
+let set node current = current |> Trie.setOrUpdate node StructuredTextNode.union
+let add name node current = current |> Trie.addOrUpdate name node StructuredTextNode.union
+
+type [<RequireQualifiedAccess>] ClassKind<'a, 'b, 'c> =
+  | NormalClass of 'a
+  | ExportDefaultClass of 'b
+  | AnonymousInterface of 'c
+
+let rec emitClass flags overrideFunc (ctx: Context) (current: StructuredText) (c: ClassOrAnonymousInterface) (additionalMembers: Context -> EmitTypeFlags -> OverrideFunc -> list<StructuredTextItem>, additionalKnownTypes: Set<KnownType>, forceScoped: Scoped option) =
   let emitType orf ctx ty = emitTypeImpl flags orf ctx ty
 
   let typrms = List.map (fun (tp: TypeParam) -> TypeVar tp.name) c.typeParams
-  let name, isAnonymous, selfTy, overrideFunc =
+  let kind, selfTy,  overrideFunc =
     match c.name with
-    | Some n ->
-      let k = List.rev (n :: ctx.currentNamespace)
-      let ident = { name = [n]; fullName = Some k; loc = UnknownLocation }
+    | Choice1Of2 (Name n) ->
+      let k = { name = (ctx |> Context.getFullName [n]).name; source = ctx.currentSourceFile }
+      let ident = { name = [n]; fullName = [k]; kind = Some (Set.ofList Kind.OfClass); parent = None; loc = UnknownLocation }
       let selfTy =
         if List.isEmpty c.typeParams then Ident ident
         else App (AIdent ident, typrms, UnknownLocation)
@@ -825,47 +888,75 @@ let emitClass flags overrideFunc (ctx: Context) (current: StructuredText) (c: Cl
         if not ctx.options.recModule.IsOffOrDefault then overrideFunc
         else
           let orf _emitType _ctx = function
-            | Ident { name = [n']; fullName = Some k' } when n = n' && k = k' -> Some (str "t")
-            | App (AIdent { name = [n']; fullName = Some k' }, ts, _) when n = n' && k = k' ->
+            | Ident { name = [n']; fullName = fns } when n = n' && fns |> List.contains k -> Some (str "t")
+            | App (AIdent { name = [n']; fullName = fns }, ts, _) when n = n' && fns |> List.contains k ->
               Some (Type.appOpt (str "t") (List.map (_emitType _ctx) ts))
             | _ -> None
           OverrideFunc.combine overrideFunc orf
-      n, false, selfTy, overrideFunc
-    | None ->
-      match ctx.anonymousInterfacesMap |> Map.tryFind c with
+      ClassKind.NormalClass {| name = n; orig = c.MapName(fun _ -> Name n) |},
+      selfTy,
+      overrideFunc
+    | Choice1Of2 ExportDefaultUnnamedClass ->
+      ClassKind.ExportDefaultClass {| orig = c.MapName(fun _ -> ExportDefaultUnnamedClass) |},
+      PolymorphicThis,
+      overrideFunc
+    | Choice2Of2 Anonymous ->
+      let ai = c.MapName (fun _ -> Anonymous)
+      match ctx |> Context.bindCurrentSourceInfo (fun info -> info.anonymousInterfacesMap |> Map.tryFind ai) with
       | None -> failwith "impossible_emitClass_unknown_anonymousInterface"
       | Some i ->
         let selfTy =
-          if List.isEmpty c.typeParams then AnonymousInterface c
-          else App (AAnonymousInterface c, typrms, UnknownLocation)
+          if List.isEmpty c.typeParams then AnonymousInterface ai
+          else App (AAnonymousInterface ai, typrms, UnknownLocation)
         let orf _emitType _ctx = function
-          | AnonymousInterface a when a = c -> Some (str "t")
-          | App (AAnonymousInterface a, ts, _) when a = c ->
+          | AnonymousInterface a when a = ai -> Some (str "t")
+          | App (AAnonymousInterface a, ts, _) when a = ai ->
             Some (Type.appOpt (str "t") (ts |> List.map (_emitType _ctx)))
           | _ -> None
-        anonymousInterfaceModuleName i,
-        true,
+        ClassKind.AnonymousInterface {|
+          name = anonymousInterfaceModuleName ctx i
+          orig = c.MapName(fun _ -> Anonymous)
+        |},
         selfTy,
         OverrideFunc.combine overrideFunc orf
 
-  let knownTypes = Statement.getKnownTypes ctx [ClassDef c] |> Set.union additionalKnownTypes
+  let knownTypes =
+    let dummy = c.MapName(fun _ -> ExportDefaultUnnamedClass)
+    Statement.getKnownTypes ctx [Class dummy] |> Set.union additionalKnownTypes
+
+  let isAnonymous =
+    match kind with
+    | ClassKind.AnonymousInterface _ -> true
+    | _ -> false
 
   let node =
     let ctx, innerCtx =
       (),
-      {| (ctx |> Context.ofChildNamespace name) with
-          options =
-            if not isAnonymous then ctx.options
-            else
-              // no need to generate t_n types for anonymous interfaces
-              ctx.options |> JS.cloneWith (fun o -> o.safeArity <- o.safeArity.WithProvide(false)) |}
-
+      ctx
+      |> (match kind with
+          | ClassKind.NormalClass x -> Context.ofChildNamespace x.name
+          | ClassKind.AnonymousInterface x -> Context.ofChildNamespace x.name
+          | ClassKind.ExportDefaultClass _ -> id)
+      |> Context.mapOptions (fun options ->
+        if not isAnonymous then options
+        else
+          // no need to generate t_n types for anonymous interfaces
+          ctx.options |> JS.cloneWith (fun o -> o.safeArity <- o.safeArity.WithProvide(false)))
     let typrms = List.map (fun (tp: TypeParam) -> tprintf "'%s" tp.name) c.typeParams
+    let selfTyText = Type.appOpt (str "t") typrms
+    let currentNamespace = innerCtx |> Context.getFullName []
 
     let labels =
       let emitType_ = emitType overrideFunc // labels should not have polymorphic this type
-      getLabelsOfFullName emitType_ innerCtx (List.rev innerCtx.currentNamespace) c.typeParams
-      |> function Choice1Of2 xs -> xs | Choice2Of2 (_, x) -> [x]
+      match kind with
+      | ClassKind.NormalClass _ ->
+        getLabelsOfFullName emitType_ innerCtx currentNamespace c.typeParams
+        |> function Choice1Of2 xs -> xs | Choice2Of2 (_, x) -> [x]
+      | ClassKind.ExportDefaultClass _ ->
+        c.implements
+        |> List.map (getAllInheritancesAndSelf innerCtx) |> Set.unionMany
+        |> getLabelsFromInheritingTypes emitType_ innerCtx
+      | ClassKind.AnonymousInterface _ -> []
 
     let useTags =
          not isAnonymous
@@ -876,7 +967,7 @@ let emitClass flags overrideFunc (ctx: Context) (current: StructuredText) (c: Cl
       if useTags then
         Type.appOpt (str "this") (str "'tags" :: typrms)
       else
-        Type.appOpt (str "t") typrms
+        selfTyText
 
     let overrideFunc =
       OverrideFunc.combine overrideFunc <|
@@ -888,19 +979,22 @@ let emitClass flags overrideFunc (ctx: Context) (current: StructuredText) (c: Cl
 
     let members = [
       for ma, m in c.members do
-        yield! emitMembers emitType_ innerCtx name PolymorphicThis ma m
+        yield! emitMembers emitType_ innerCtx PolymorphicThis ma m
       yield! additionalMembers innerCtx flags overrideFunc
     ]
 
     let scoped =
-      let scoped = forceScoped |> Option.defaultValue Scoped.No
-      let shouldBeScoped =
-        c.members |> List.exists (fun (ma, m) ->
-          if ma.isStatic then true
-          else match m with Constructor _ -> true | _ -> false) // constructor generates global value
-      Scoped.union
-        scoped
-        (if shouldBeScoped then Scoped.Yes else Scoped.No)
+      match kind with
+      | ClassKind.ExportDefaultClass _ -> Scoped.No
+      | _ ->
+        let scoped = forceScoped |> Option.defaultValue Scoped.No
+        let shouldBeScoped =
+          c.members |> List.exists (fun (ma, m) ->
+            if ma.isStatic then true
+            else match m with Constructor _ -> true | _ -> false) // constructor generates global value
+        Scoped.union
+          scoped
+          (if shouldBeScoped then Scoped.Yes else Scoped.No)
 
     let docCommentLines =
       c.comments |> List.distinct |> List.map emitCommentBody
@@ -918,7 +1012,7 @@ let emitClass flags overrideFunc (ctx: Context) (current: StructuredText) (c: Cl
     let polymorphicThisDefinition =
       if useTags then
         let tags =
-          getLabelOfFullName emitType_ innerCtx (List.rev innerCtx.currentNamespace) c.typeParams
+          getLabelOfFullName emitType_ innerCtx currentNamespace c.typeParams
           |> function Choice1Of2 xs -> xs | Choice2Of2 (_, x) -> [x]
           |> emitLabelsBody innerCtx
           |> between "[> " " ]"
@@ -933,12 +1027,15 @@ let emitClass flags overrideFunc (ctx: Context) (current: StructuredText) (c: Cl
         if innerCtx.options.recModule.IsOffOrDefault then
           let t =
             if isAnonymous then
-              anonymousInterfaceToIdentifier innerCtx c
+              anonymousInterfaceToIdentifier innerCtx (c.MapName(fun _ -> Anonymous))
             else
-              Naming.flattenedTypeName (List.rev innerCtx.currentNamespace) |> str
+              (innerCtx |> Context.getFullName []).name |> Naming.flattenedTypeName |> str
           Type.appOpt t (c.typeParams |> List.map (fun tp -> TypeVar tp.name |> emitType_ innerCtx))
         else
-          GetSelfTyText.class_ { flags with failContravariantTypeVar = true } overrideFunc innerCtx c
+          match kind with
+          | ClassKind.NormalClass x -> GetSelfTyText.class_ { flags with failContravariantTypeVar = true } overrideFunc innerCtx x.orig
+          | ClassKind.ExportDefaultClass x -> GetSelfTyText.class_ { flags with failContravariantTypeVar = true } overrideFunc innerCtx x.orig
+          | ClassKind.AnonymousInterface _ -> str "private Ojs.t"
       emitTypeAliases flags overrideFunc innerCtx c.typeParams selfTyText
 
     let castFunctions = [
@@ -947,67 +1044,129 @@ let emitClass flags overrideFunc (ctx: Context) (current: StructuredText) (c: Cl
         let castTy =
           Type.arrow [
             polymorphicThis
-            Type.appOpt (str "t") typrms
+            selfTyText
           ]
         yield ScopeIndependent (val_ "cast_from" castTy +@ " " + Attr.js_custom_val (let_ "cast_from" [] None (str "Obj.magic")))
 
       if innerCtx.options.subtyping |> List.contains Subtyping.CastFunction then
         for parent in c.implements do
-          let ty = Function { isVariadic = false; args = [Choice2Of2 selfTy]; returnType = parent; loc = UnknownLocation } |> emitType_ innerCtx
+          let ty = func { isVariadic = false; args = [Choice2Of2 selfTy]; returnType = parent; loc = UnknownLocation } |> emitType_ innerCtx
           let parentName = getHumanReadableName innerCtx parent
           yield overloaded (fun rename -> [val_ (rename $"cast_to_{parentName}") ty + str " " + Attr.attr Attr.Category.Block "js.cast" empty])
 
-      // add `to_ml` and `of_ml` if the type is primitive and has an OCaml equivalent (e.g. number, boolean, string, array)
-      match c.name with
-      | None -> ()
-      | Some name ->
-        match Type.jsablePrimTypeInterfaces |> Map.tryFind name with
+      match kind with
+      | ClassKind.NormalClass x ->
+        // add `to_ml` and `of_ml` if the type is primitive and has an OCaml equivalent (e.g. number, boolean, string, array)
+        match Type.jsablePrimTypeInterfaces |> Map.tryFind x.name with
         | None -> ()
         | Some prim ->
           let targetTy =
             if List.isEmpty c.typeParams then Prim prim
             else App (APrim prim, c.typeParams |> List.map (fun tp -> TypeVar tp.name), UnknownLocation)
-          let toMlTy = Function { isVariadic = false; args = [Choice2Of2 selfTy]; returnType = targetTy; loc = UnknownLocation } |> emitType_ innerCtx
-          let ofMlTy = Function { isVariadic = false; args = [Choice2Of2 targetTy]; returnType = selfTy; loc = UnknownLocation } |> emitType_ innerCtx
+          let toMlTy = func { isVariadic = false; args = [Choice2Of2 selfTy]; returnType = targetTy; loc = UnknownLocation } |> emitType_ innerCtx
+          let ofMlTy = func { isVariadic = false; args = [Choice2Of2 targetTy]; returnType = selfTy; loc = UnknownLocation } |> emitType_ innerCtx
           yield
             overloaded (fun rename -> [
               val_ (rename "to_ml") toMlTy + str " " + Attr.attr Attr.Category.Block "js.cast" empty
               val_ (rename "of_ml") ofMlTy + str " " + Attr.attr Attr.Category.Block "js.cast" empty
             ])
+      | _ -> ()
     ]
+
+    let builder =
+      let emitType_ ctx ty =
+        emitTypeImpl { flags with needParen = true; variance = Contravariant } overrideFunc ctx ty
+      if not c.isPOJO then []
+      else
+        let field (fl: FieldLike) =
+          let value, isOptional =
+            match fl.value with
+            | Prim Null | Prim Undefined -> Prim Never, true
+            | Union u ->
+              let nulls, others =
+                u.types |> List.partition (function Prim Null | Prim Undefined -> true | _ -> false)
+              if List.isEmpty nulls then fl.value, fl.isOptional
+              else Union { types = others }, true
+            | _ -> fl.value, fl.isOptional
+          {| fl with value = value |> emitType_ innerCtx; isOptional = isOptional |}
+        let fields =
+          c.members
+          |> List.choose (fun (ma, m) ->
+            match m with
+            | Field (fl, (Mutable | ReadOnly)) -> Some (field fl)
+            | Getter fl -> Some (field fl)
+            (*
+            | Method (name, ft, _) ->
+              let value = emitType_ innerCtx (Func (ft, [], ma.loc))
+              Some {| isOptional = false; name = name; value = value |}
+            *)
+            | _ -> None)
+        [overloaded (fun rename -> [jsBuilder (rename "create") fields selfTyText])]
 
     let items = [
       yield! typeDefinition
       yield! tagsDefinition |> Option.toList
       yield! polymorphicThisDefinition |> Option.toList
       yield! members
+      yield! builder
       yield! castFunctions
     ]
 
     {| StructuredTextNode.empty with items = items; docCommentLines = docCommentLines; knownTypes = knownTypes; scoped = scoped |}
 
   let export =
-    match c.name with
-    | None -> None
-    | Some name ->
+    match kind with
+    | ClassKind.NormalClass x ->
       let kind =
-        if node.scoped <> Scoped.No then [Kind.Type; Kind.ClassLike; Kind.Value]
-        else [Kind.Type; Kind.ClassLike]
-      getExportFromStatement ctx name kind (if c.isInterface then "interface" else "class") (ClassDef c)
-  current
-  |> Trie.addOrUpdate [name] node StructuredTextNode.union
-  |> Trie.setOrUpdate {| StructuredTextNode.empty with scoped = (if node.scoped <> Scoped.No then Scoped.Yes else Scoped.No); exports = Option.toList export |} StructuredTextNode.union
+        if not c.isInterface || node.scoped <> Scoped.No then Kind.OfClass
+        else Kind.OfInterface
+      getExportFromStatement ctx x.name kind (if c.isInterface then "interface" else "class") (Class x.orig)
+    | _ -> None
 
-let emitValue flags overrideFunc ctx v =
+  let addAsNode (name: string) =
+    current
+    |> add [name] node
+    |> inTrie [name] (addAnonymousInterface flags ctx knownTypes)
+    |> set {| StructuredTextNode.empty with scoped = (if node.scoped <> Scoped.No then Scoped.Yes else Scoped.No); exports = Option.toList export |}
+
+  match kind with
+  | ClassKind.NormalClass x -> addAsNode x.name
+  | ClassKind.AnonymousInterface x -> addAsNode x.name
+  | ClassKind.ExportDefaultClass _ ->
+    current
+    |> set {|
+        StructuredTextNode.empty with
+          scoped = Scoped.Force Naming.exportDefaultClassStubName
+          exports = [ExportItem.DefaultUnnamedClass node]
+        |}
+    |> addAnonymousInterface flags ctx knownTypes
+
+and addAnonymousInterfaceExcluding emitTypeFlags (ctx: Context) knownTypes ais (current: StructuredText) =
+  knownTypes
+  |> Seq.choose (function KnownType.AnonymousInterface (a, info) -> Some (a, info) | _ -> None)
+  |> Seq.filter (fun (a, _) -> ais |> List.contains a |> not)
+  |> Seq.fold (fun (current: StructuredText) (a, _) ->
+    let shouldSkip =
+      current.value
+      |> Option.map (fun v -> v.anonymousInterfaces |> Set.contains a)
+      |> Option.defaultValue false
+    if shouldSkip then current
+    else
+      emitClass emitTypeFlags OverrideFunc.noOverride ctx current (a.MapName Choice2Of2) ((fun _ _ _ -> []), Set.empty, None)
+      |> set {| StructuredTextNode.empty with anonymousInterfaces = Set.singleton a |}
+  ) current
+and addAnonymousInterface emitTypeFlags ctx knownTypes (current: StructuredText) = addAnonymousInterfaceExcluding emitTypeFlags ctx knownTypes [] current
+
+let emitVariable flags overrideFunc ctx (v: Variable) =
   let emitType = emitTypeImpl flags
   let emitType_ = emitType overrideFunc
 
   let ty, attr =
     match v.typ with
-    | Function _ ->
-      v.typ, Attr.js_global v.name
+    | Func (ft, _, loc) ->
+      Func (ft, [], loc), Attr.js_global v.name
     | _ ->
-      let tyAsGetter = Function { args = [Choice2Of2 (Prim Void)]; isVariadic = false; returnType = v.typ; loc = v.loc }
+      let tyAsGetter = func { args = [Choice2Of2 (Prim Void)]; isVariadic = false; returnType = v.typ; loc = v.loc }
       tyAsGetter, Attr.js_get v.name
   let comments =
     if List.isEmpty v.comments then []
@@ -1019,6 +1178,84 @@ let emitValue flags overrideFunc ctx v =
     ])
   comments @ [item]
 
+let emitFunction flags overrideFunc ctx (f: Function) =
+  let emitType = emitTypeImpl flags
+  let emitType_ = emitType overrideFunc
+
+  let ty, attr =
+    Func (f.typ, [], f.loc), Attr.js_global f.name
+
+  let comments =
+    if List.isEmpty f.comments then []
+    else ScopeIndependent empty :: [f.comments |> List.map emitCommentBody |> concat newline |> docComment |> ScopeIndependent]
+  let item =
+    let ty = emitType_ ctx ty
+    overloaded (fun rename -> [
+      val_ (Naming.valueName f.name |> rename) ty + str " " + attr
+    ])
+  comments @ [item]
+
+let emitImport (ctx: Context) (i: Import) : StructuredTextItem list =
+  let emitImportClause (c: ImportClause) =
+    let getModuleName (specifier: string) =
+      if specifier.StartsWith(".") |> not then Naming.jsModuleNameToOCamlModuleName specifier |> Some
+      else
+        match JsHelper.tryGetActualFileNameFromRelativeImportPath ctx.currentSourceFile ctx.state.fileNames specifier with
+        | Some _ -> None // if the imported file is included in the input files, skip emitting it
+        | None ->
+          JsHelper.resolveRelativeImportPath (ctx.state.info |> Result.toOption) ctx.currentSourceFile ctx.state.fileNames specifier
+          |> JsHelper.InferenceResult.tryUnwrap
+          |> Option.defaultValue specifier
+          |> Naming.jsModuleNameToOCamlModuleName
+          |> Some
+
+    let isModule (name: string) (kind: Set<Kind> option) =
+      i.isTypeOnly
+      || kind |> Option.map Kind.generatesOCamlModule
+              |> Option.defaultValue false
+      || ctx |> Context.tryCurrentSourceInfo (fun i -> i.unknownIdentTypes |> Trie.containsKey [name])
+             |> Option.defaultValue false
+      || name |> Naming.isCase Naming.PascalCase
+
+    match c with
+    | LocalImport x ->
+      let shouldEmit =
+        match x.kind with
+        | Some kind -> kind |> Kind.generatesOCamlModule
+        | None -> x.target |> Ident.getKind ctx |> Kind.generatesOCamlModule
+      if shouldEmit then
+        [moduleAlias (Naming.moduleName x.name) (x.target.name |> Naming.structured Naming.moduleName) |> ImportText]
+      else []
+    | NamespaceImport x when isModule x.name x.kind ->
+      getModuleName x.specifier
+      |> Option.map (fun moduleName ->
+        [moduleAlias (Naming.moduleName x.name) (sprintf "%s.Export" moduleName) |> ImportText])
+      |> Option.defaultValue []
+    | ES6WildcardImport s ->
+      getModuleName s
+      |> Option.map (fun moduleName -> [open_ [sprintf "%s.Export" moduleName] |> ImportText])
+      |> Option.defaultValue []
+    | ES6DefaultImport x when isModule x.name x.kind ->
+      getModuleName x.specifier
+      |> Option.map (fun moduleName ->
+        [moduleAlias (Naming.moduleName x.name) (sprintf "%s.Export.Default" moduleName) |> ImportText])
+      |> Option.defaultValue []
+    | ES6Import x when isModule x.name x.kind ->
+      let name =
+        match x.renameAs with
+        | Some name -> Naming.moduleName name
+        | None -> Naming.moduleName x.name
+      getModuleName x.specifier
+      |> Option.map (fun moduleName ->
+        [moduleAlias name (sprintf "%s.Export.%s" moduleName (Naming.moduleName x.name)) |> ImportText])
+      |> Option.defaultValue []
+    | NamespaceImport _ | ES6DefaultImport _ | ES6Import _ -> []
+
+  [ yield! i.comments |> List.map (emitCommentBody >> comment >> ImportText)
+    yield commentStr i.origText |> ImportText
+    for c in i.clauses do
+      yield! emitImportClause c]
+
 let createStructuredText (rootCtx: Context) (stmts: Statement list) : StructuredText =
   let emitTypeFlags = { EmitTypeFlags.defaultValue with skipAttributesOnContravariantPosition = true }
   let overrideFunc = OverrideFunc.noOverride
@@ -1027,46 +1264,45 @@ let createStructuredText (rootCtx: Context) (stmts: Statement list) : Structured
   let emitSelfType = emitTypeImpl { emitTypeFlags with failContravariantTypeVar = true } overrideFunc
 
   /// convert interface members to appropriate statements
-  let intfToStmts (moduleIntf: Class) ctx flags overrideFunc =
-    let emitAsValue name typ typrms isConst (memberAttr: MemberAttribute) =
+  let intfToStmts (moduleIntf: Class<_>) ctx flags overrideFunc =
+    let emitAsVariable name typ isConst (memberAttr: MemberAttribute) =
       let v =
-        { name = name; typ = typ; typeParams = typrms;
+        { name = name; typ = typ;
           isConst = isConst; isExported = Exported.No; accessibility = Some memberAttr.accessibility;
           comments = memberAttr.comments; loc = memberAttr.loc }
-      emitValue flags overrideFunc ctx v
+      emitVariable flags overrideFunc ctx v
+    let emitAsFunction name typ typrms (memberAttr: MemberAttribute) =
+      let f =
+        { name = name; typ = typ; typeParams = typrms;
+          isExported = Exported.No; accessibility = Some memberAttr.accessibility;
+          comments = memberAttr.comments; loc = memberAttr.loc }
+      emitFunction flags overrideFunc ctx f
     [ for ma, m in moduleIntf.members do
         let cmt =
           if List.isEmpty ma.comments then []
           else ScopeIndependent empty :: [ma.comments |> List.map emitCommentBody |> concat newline |> docComment |> ScopeIndependent]
         match m with
-        | Field (fl, mt, tps) ->
-          yield! emitAsValue fl.name fl.value tps (mt = ReadOnly) ma
+        | Field (fl, mt) ->
+          yield! emitAsVariable fl.name fl.value (mt = ReadOnly) ma
         | Getter fl ->
-          yield! emitAsValue fl.name fl.value [] true ma
+          yield! emitAsVariable fl.name fl.value true ma
         | Setter _ -> ()
         | Method (name, ft, tps) ->
-          yield! emitAsValue name (Function ft) tps true ma
-        | New (ft, _tps) ->
-          let ty = emitType_ ctx (Function ft)
+          yield! emitAsFunction name ft tps ma
+        | Newable (ft, _tps) ->
+          let ty = emitType_ ctx (func ft)
           yield! cmt
           yield overloaded (fun rename -> [val_ (rename "create") ty + str " " + Attr.js_create])
-        | FunctionInterface (ft, _tps) ->
-          let ty = emitType_ ctx (Function ft)
+        | Callable (ft, _tps) ->
+          let ty = emitType_ ctx (func ft)
           yield! cmt
           yield overloaded (fun rename -> [val_ (rename "invoke") ty + str " " + Attr.js_invoke])
         | Constructor _ -> failwith "impossible_emitStructuredDefinition_Pattern_intfToModule_Constructor" // because interface!
-        | Indexer (ft, _) -> yield ScopeIndependent (comment (tprintf "unsupported indexer of type: %s" (Type.pp (Function ft))))
+        | Indexer (ft, _) -> yield ScopeIndependent (comment (tprintf "unsupported indexer of type: %s" (Type.pp (func ft))))
         | UnknownMember (Some msg) -> yield ScopeIndependent (commentStr msg)
         | SymbolIndexer _ | UnknownMember None -> () ]
 
   let rec folder ctx (current: StructuredText) (s: Statement) : StructuredText =
-    let getModule name =
-      match current |> Trie.getSubTrie [name] with
-      | Some t -> t
-      | None -> Trie.empty
-    let setModule name trie = current |> Trie.setSubTrie [name] trie
-    let setNode node = current |> Trie.setOrUpdate node StructuredTextNode.union
-
     let comments =
       match (s :> ICommented<_>).getComments() with
       | [] -> []
@@ -1076,139 +1312,166 @@ let createStructuredText (rootCtx: Context) (stmts: Statement list) : Structured
     let addExport name kind kindString current =
       match getExportFromStatement ctx name kind kindString s with
       | None -> current
-      | Some e -> current |> Trie.setOrUpdate {| StructuredTextNode.empty with exports = [e] |} StructuredTextNode.union
+      | Some e -> current |> set {| StructuredTextNode.empty with exports = [e] |}
+    let addAnonymousInterfaceWithKnownTypes knownTypes current = addAnonymousInterface emitTypeFlags ctx knownTypes current
+    let addAnonymousInterface current = addAnonymousInterfaceWithKnownTypes (knownTypes ()) current
+    let addAnonymousInterfaceExcludingWithKnownTypes knownTypes ais current = addAnonymousInterfaceExcluding emitTypeFlags ctx knownTypes ais current
+    let addAnonymousInterfaceExcluding ais current = addAnonymousInterfaceExcludingWithKnownTypes (knownTypes ()) ais current
 
     match s with
     | Module m ->
       let module' =
         let node = {| StructuredTextNode.empty with docCommentLines = comments; knownTypes = knownTypes () |}
-        let module' = getModule m.name |> Trie.setOrUpdate node StructuredTextNode.union
+        let module' = current |> getTrie [m.name] |> set node
         let ctx = ctx |> Context.ofChildNamespace m.name
         m.statements |> List.fold (folder ctx) module'
-      let result = setModule m.name module'
+      let current =
+        current |> setTrie [m.name] module'
       match module'.value with
-      | None -> result
+      | None -> current
       | Some v ->
         let kind =
-          if v.scoped <> Scoped.No then [Kind.Module; Kind.Value]
-          else [Kind.Module]
-        result |> addExport m.name kind (if m.isNamespace then "namespace" else "module")
-    | ClassDef c ->
-      emitClass emitTypeFlags OverrideFunc.noOverride ctx current c ((fun _ _ _ -> []), Set.empty, None)
-    | EnumDef e ->
-      let module' =
+          if v.scoped <> Scoped.No then Kind.OfModule
+          else Kind.OfNamespace
+        current |> addExport m.name kind (if m.isNamespace then "namespace" else "module")
+    | Global m -> m.statements |> List.fold (folder ctx) current
+    | Class c ->
+      emitClass emitTypeFlags OverrideFunc.noOverride ctx current (c.MapName Choice1Of2) ((fun _ _ _ -> []), Set.empty, None)
+    | Enum e ->
+      current
+      |> inTrie [e.name] (fun module' ->
         let ctx = ctx |> Context.ofChildNamespace e.name
-        let items = emitTypeAliases emitTypeFlags OverrideFunc.noOverride ctx [] (GetSelfTyText.enumCases e.cases)
-        let node = {| StructuredTextNode.empty with items = items; docCommentLines = comments; knownTypes = knownTypes () |}
+        let items = emitTypeAliases emitTypeFlags OverrideFunc.noOverride ctx [] (GetSelfTyText.enumCases e e.cases)
         let module' =
-          getModule e.name |> Trie.setOrUpdate node StructuredTextNode.union
+          let node = {| StructuredTextNode.empty with items = items; docCommentLines = comments; knownTypes = knownTypes () |}
+          module' |> set node
         e.cases |> List.fold (fun state c ->
           let ctx = ctx |> Context.ofChildNamespace c.name
           let comments = List.map emitCommentBody c.comments
           let items =
-            emitTypeAliases emitTypeFlags OverrideFunc.noOverride ctx [] (GetSelfTyText.enumCases [c])
+            emitTypeAliases emitTypeFlags OverrideFunc.noOverride ctx [] (GetSelfTyText.enumCases e [c])
           let node = {| StructuredTextNode.empty with items = items; docCommentLines = comments; knownTypes = knownTypes () |}
-          state |> Trie.addOrUpdate [c.name] node StructuredTextNode.union
-        ) module'
-      setModule e.name module' |> addExport e.name [Kind.Type; Kind.Enum] "enum"
+          state |> add [c.name] node
+        ) module')
+      |> addExport e.name Kind.OfEnum "enum"
     | TypeAlias ta ->
       let ctx = ctx |> Context.ofChildNamespace ta.name
       let items =
         emitTypeAliases emitTypeFlags OverrideFunc.noOverride ctx ta.typeParams (emitSelfType ctx ta.target)
       let node = {| StructuredTextNode.empty with items = items; docCommentLines = comments; knownTypes = knownTypes () |}
-      let module' =
-        getModule ta.name |> Trie.setOrUpdate node StructuredTextNode.union
-      setModule ta.name module' |> addExport ta.name [Kind.Type] "type"
+      current
+      |> inTrie [ta.name] (set node)
+      |> addExport ta.name Kind.OfTypeAlias "type"
+      |> inTrie [ta.name] addAnonymousInterface
     | Pattern p ->
       let fallback current =
-        p.underlyingStatements |> List.fold (folder ctx) current
+        p.underlyingStatements
+        |> List.fold (folder ctx) current
+        |> addAnonymousInterface
       match p with
-      | ImmediateInstance (intf & { name = Some intfName }, value) when Simplify.Has(ctx.options.simplify, Simplify.ImmediateInstance) ->
-        let knownTypesInMembers = Statement.getKnownTypes ctx [ClassDef intf]
+      | ImmediateInstance (intf & { name = Name intfName }, value) when Simplify.Has(ctx.options.simplify, Simplify.ImmediateInstance) ->
+        let knownTypesInMembers = Statement.getKnownTypes ctx [Class intf]
         let createModule () =
           let items = intfToStmts intf (ctx |> Context.ofChildNamespace value.name) emitTypeFlags overrideFunc
           {| StructuredTextNode.empty with items = items; knownTypes = knownTypesInMembers; scoped = Scoped.Force value.name |}
         if knownTypesInMembers |> Set.contains (KnownType.Ident (ctx |> Context.getFullName [intfName])) then
           fallback current
         else
-          getModule value.name
-          |> Trie.setOrUpdate (createModule ()) StructuredTextNode.union
-          |> setModule value.name
-          |> Trie.setOrUpdate {| StructuredTextNode.empty with scoped = Scoped.Yes |} StructuredTextNode.union
-          |> addExport value.name [Kind.Type; Kind.ClassLike; Kind.Value] "interface"
+          current
+          |> inTrie [value.name] (set (createModule ()))
+          |> set {| StructuredTextNode.empty with scoped = Scoped.Yes |}
+          |> addExport value.name Kind.OfClass "interface"
+          |> inTrie [value.name] addAnonymousInterface
       | ImmediateConstructor (baseIntf, ctorIntf, ctorValue) when Simplify.Has(ctx.options.simplify, Simplify.ImmediateConstructor) ->
-        emitClass emitTypeFlags OverrideFunc.noOverride ctx current baseIntf (intfToStmts ctorIntf, Statement.getKnownTypes ctx [ClassDef ctorIntf], Some (Scoped.Force ctorValue.name))
+        emitClass emitTypeFlags OverrideFunc.noOverride ctx current (baseIntf.MapName Choice1Of2) (intfToStmts ctorIntf, Statement.getKnownTypes ctx [Class ctorIntf], Some (Scoped.Force ctorValue.name))
       | _ -> fallback current
-    | Value value ->
+    | Function func ->
+      let node =
+        {| StructuredTextNode.empty with
+            items = emitFunction emitTypeFlags overrideFunc ctx func
+            knownTypes = knownTypes ()
+            scoped = Scoped.Yes |}
+      current
+      |> set node
+      |> addExport func.name Kind.OfValue "function"
+      |> addAnonymousInterface
+    | Variable value ->
       let fallback current =
         let node =
           {| StructuredTextNode.empty with
-              items = emitValue emitTypeFlags overrideFunc ctx value
+              items = emitVariable emitTypeFlags overrideFunc ctx value
               knownTypes = knownTypes ()
               scoped = Scoped.Yes |}
         current
-        |> Trie.setOrUpdate node StructuredTextNode.union
-        |> addExport value.name [Kind.Value] (if value.isConst then "const" else "let")
-
+        |> set node
+        |> addExport value.name Kind.OfValue (if value.isConst then "const" else "let")
+        |> addAnonymousInterface
       let inline (|Dummy|) _ = []
       match value.typ with
       | AnonymousInterface intf when Simplify.Has(ctx.options.simplify, Simplify.AnonymousInterfaceValue) ->
         let knownTypes = knownTypes ()
         let items = intfToStmts intf (ctx |> Context.ofChildNamespace value.name) emitTypeFlags overrideFunc
-        getModule value.name
-        |> Trie.setOrUpdate {| StructuredTextNode.empty with items = items; knownTypes = knownTypes; scoped = Scoped.Force value.name |} StructuredTextNode.union
-        |> setModule value.name
-        |> Trie.setOrUpdate
-          {| StructuredTextNode.empty with
-              items = emitValue emitTypeFlags overrideFunc ctx value
-              knownTypes = knownTypes
-              scoped = Scoped.Yes |} StructuredTextNode.union
-        |> addExport value.name [Kind.Value] (if value.isConst then "const" else "let")
-      | Ident { fullName = Some fn; loc = loc } & Dummy tyargs
-      | App (AIdent { fullName = Some fn }, tyargs, loc) when Simplify.Has(ctx.options.simplify, Simplify.NamedInterfaceValue) ->
+        current
+        |> inTrie [value.name]
+          (set
+            {| StructuredTextNode.empty with
+                items = items
+                knownTypes =
+                  knownTypes |> Set.filter (function KnownType.AnonymousInterface (ai, _) -> ai.loc <> intf.loc | _ -> true)
+                scoped = Scoped.Force value.name |})
+        |> set {| StructuredTextNode.empty with scoped = Scoped.Yes |}
+        |> addExport value.name Kind.OfClass (if value.isConst then "const" else "let")
+        |> inTrie [value.name] (addAnonymousInterfaceExcluding [intf])
+      | Ident (i & { loc = loc }) & Dummy tyargs
+      | App (AIdent i, tyargs, loc) when Simplify.Has(ctx.options.simplify, Simplify.NamedInterfaceValue) ->
         let intf =
-          FullName.tryLookupWith ctx fn (function ClassName c when c.isInterface -> Some c | _ -> None)
+          Ident.pickDefinition ctx i (function Definition.Class c when c.isInterface -> Some c | _ -> None)
         match intf with
         | None -> fallback current
         | Some intf ->
-          let bindings = createBindings fn loc intf.typeParams tyargs
+          let bindings = createBindings i.name loc intf.typeParams tyargs
           let intf = intf |> mapInClass (substTypeVar bindings) ctx
           let name = value.name + "Static"
-          let knownTypesInMembers = Statement.getKnownTypes ctx [ClassDef intf]
+          let knownTypesInMembers = Statement.getKnownTypes ctx [Class intf]
           let createModule () =
             let items = intfToStmts intf ctx emitTypeFlags overrideFunc
             {| StructuredTextNode.empty with items = items; knownTypes = knownTypesInMembers; scoped = Scoped.Force value.name |}
-          getModule name
-          |> Trie.setOrUpdate (createModule ()) StructuredTextNode.union
-          |> setModule name
-          |> Trie.setOrUpdate {| StructuredTextNode.empty with scoped = Scoped.Yes |} StructuredTextNode.union
-          |> addExport name [Kind.Value] (if value.isConst then "const" else "let")
+          current
+          |> inTrie [name] (set (createModule ()))
+          |> addExport name Kind.OfClass (if value.isConst then "const" else "let")
+          |> inTrie [name] (addAnonymousInterfaceWithKnownTypes knownTypesInMembers)
           |> fallback
       | _ -> fallback current
-    | Import _ -> current // nop
+    | Import i ->
+      current |> set {| StructuredTextNode.empty with items = emitImport ctx i |}
     | Export e ->
-      let kind =
-        match e.clause with
+      let getKind = function
         | CommonJsExport i | ES6DefaultExport i -> i |> Ident.getKind ctx
         | ES6Export x -> x.target |> Ident.getKind ctx
         | NamespaceExport _ -> Set.empty
-      setNode {| StructuredTextNode.empty with exports = [{| e with kind = kind |}] |}
+      current
+      |> set
+        {| StructuredTextNode.empty with
+            exports = [ExportItem.Export {| e with clauses = e.clauses |> List.map (fun c -> c, getKind c) |}] |}
+    | ReExport e ->
+      let getKind = function
+        | ES6ReExport x -> x.target |> Ident.getKind ctx
+        | ES6NamespaceReExport _ | ES6WildcardReExport -> Set.empty
+      current
+      |> set
+        {| StructuredTextNode.empty with
+            exports = [ExportItem.ReExport {| e with clauses = e.clauses |> List.map (fun c -> c, getKind c) |}] |}
     | UnknownStatement u ->
       let cmt =
-        match u.msg with
+        match u.origText with
         | Some s -> commentStr s | None -> commentStr "unknown statement"
-      setNode {| StructuredTextNode.empty with items = [ScopeIndependent cmt] |}
+      current |> set {| StructuredTextNode.empty with items = [ScopeIndependent cmt] |}
     | FloatingComment c ->
       let cmt = ScopeIndependent empty :: (c.comments |> List.map (emitCommentBody >> comment >> ScopeIndependent))
-      setNode {| StructuredTextNode.empty with items = ScopeIndependent empty :: cmt |}
+      current |> set {| StructuredTextNode.empty with items = ScopeIndependent empty :: cmt |}
   and folder' ctx stmt node = folder ctx node stmt
 
-  let anonymousInterfaces =
-    rootCtx.anonymousInterfacesMap
-    |> Map.toList
-    |> List.map (fst >> ClassDef)
-
-  (anonymousInterfaces @ stmts) |> List.fold (folder rootCtx) Trie.empty
+  stmts |> List.fold (folder rootCtx) Trie.empty
 
 type ModuleEmitter = Context -> StructuredText -> (TextModuleSig list -> text list)
 module ModuleEmitter =
@@ -1231,74 +1494,82 @@ module ModuleEmitter =
     | RecModule.Naive -> recAll
     | RecModule.Optimized -> recOptimized
 
-let emitExportModule (ctx: Context) (exports: ExportWithKind list) : text list =
-  let stopStartImplem text =
-    Attr.js_stop_start_implem_oneliner text text
+type ExportWithKind = {| comments: Comment list; clauses: (ExportClause * Set<Kind>) list; loc: Location; origText: string |}
 
-  let getComments isFirst commentOut (e: ExportWithKind) = [
-    let hasDocComment = not (List.isEmpty e.comments)
-    if not isFirst && hasDocComment then yield empty
-    yield commentStr e.origText
+let rec emitExportModule (moduleEmitter: ModuleEmitter) (ctx: Context) (exports: ExportItem list) : text list =
+  let emitComment isFirst comments origText = [
+    let hasDocComment = not (List.isEmpty comments)
+    if not isFirst && hasDocComment then yield ScopeIndependent empty
+    yield commentStr origText |> ScopeIndependent
     if hasDocComment then
-      yield e.comments |> List.map emitCommentBody |> concat newline |> commentOut
+      yield comments |> List.map emitCommentBody |> concat newline |> comment |> ScopeIndependent
   ]
 
-  let fail isFirst (e: ExportWithKind) = getComments isFirst comment e
+  let emitModuleAlias name (i: Ident) =
+    if i.kind |> Option.map Kind.generatesOCamlModule |> Option.defaultValue false then
+      [ moduleAlias
+          (name |> Naming.moduleNameReserved)
+          (i.name |> Naming.structured Naming.moduleName) |> ScopeIndependent]
+    else []
 
-  let isModule fn =
-    Set.intersect (FullName.getKind ctx fn) (Set.ofList [Kind.Type; Kind.ClassLike; Kind.Module]) |> Set.isEmpty |> not
+  let addItems items (acc: StructuredText) =
+    acc |> Trie.setOrUpdate {| StructuredTextNode.empty with items = items |} StructuredTextNode.union
 
-  let emitModuleAlias isFirst name (i: IdentType) (e: ExportWithKind) =
-    match i.fullName with
-    | Some fn ->
-      if isModule fn then
-        [ yield! getComments isFirst docComment e
-          yield tprintf "module %s = %s" name (i.name |> Naming.structured Naming.moduleName) |> stopStartImplem ]
-      else fail isFirst e
-    | None -> fail isFirst e
+  let setItems path items (acc: StructuredText) =
+    acc |> Trie.addOrUpdate path {| StructuredTextNode.empty with items = items |} StructuredTextNode.union
 
-  let rec go isFirst acc (exports: ExportWithKind list) =
+  let rec go isFirst (acc: StructuredText) (exports: ExportItem list) =
     match exports with
     | [] -> acc
-    | export :: rest ->
-      match export.clause with
-      | NamespaceExport _ -> go false (acc @ fail isFirst export) rest
-      | CommonJsExport i -> // CommonJS export
-        let body = emitModuleAlias true "Export" i export
-        [ yield! acc
-          yield! body
-          for e in rest do yield! fail false e ]
-      | _ -> // ES6 exports
-        let emit isFirst (e: ExportWithKind) =
-          match e.clause with
-          | CommonJsExport _ // `export = something;` should not appear with other export elements
-          | NamespaceExport _ -> fail isFirst e
-          | ES6DefaultExport i -> emitModuleAlias isFirst (i.name |> List.last |> Naming.moduleName) i e
-          | ES6Export x ->
-            let name =
-              match x.renameAs with
-              | Some name -> name |> Naming.moduleName
-              | None -> x.target.name |> List.last |> Naming.moduleName
-            emitModuleAlias isFirst name x.target e
-        let content =
-          emit isFirst export @ List.collect (emit false) rest
-        let m : TextModuleSig = {| name = "Export"; origName = "Export"; scope = None; content = content; docCommentBody = [] |}
-        [ yield! acc
-          yield moduleSig m ]
+    | ExportItem.DefaultUnnamedClass node :: rest ->
+      go false (acc |> Trie.addOrUpdate ["Export"; "Default"] node StructuredTextNode.union) rest
+    | ExportItem.Export export :: rest ->
+      let clauses = export.clauses |> List.map fst
+      let rec go' acc = function
+        | [] -> acc
+        | NamespaceExport _ :: rest -> go' acc rest
+        | CommonJsExport i :: rest ->
+          go' (acc |> addItems (emitModuleAlias "Export" i)) rest
+        | ES6DefaultExport e :: rest ->
+          go' (acc |> setItems ["Export"] (emitModuleAlias "Default" e)) rest
+        | ES6Export e :: rest ->
+          let name = e.renameAs |> Option.defaultValue (e.target.name |> List.last)
+          go' (acc |> setItems ["Export"] (emitModuleAlias name e.target)) rest
+      let acc =
+        let generatesExportModule =
+          clauses |> List.exists (function ES6Export _ | ES6DefaultExport _ -> true | _ -> false)
+        if generatesExportModule then
+          acc |> setItems ["Export"] (emitComment isFirst export.comments export.origText)
+        else
+          acc |> addItems (emitComment isFirst export.comments export.origText)
+      go false (go' acc clauses) rest
+    | ExportItem.ReExport export :: rest ->
+      // TODO
+      let acc =
+        acc |> setItems ["Export"] (emitComment isFirst export.comments export.origText)
+      go isFirst acc rest
 
-  let moduleGeneratingExports =
-    exports |> List.filter (fun e -> Set.intersect e.kind (Set.ofList [Kind.Type; Kind.Module]) |> Set.isEmpty |> not)
-  go true [] moduleGeneratingExports
+  let st = go true Trie.empty exports
+  let emitted = st |> emitStructuredText true moduleEmitter ctx
+  // add newline if not empty
+  if not (List.isEmpty emitted.content) then
+    empty :: emitted.content
+  else
+    []
 
-let rec private emitStructuredText (moduleEmitter: ModuleEmitter) (ctx: Context) (st: StructuredText) : {| scoped: Scoped; content: text list; docCommentBody: text list |} =
+and private emitStructuredText (reserved: bool) (moduleEmitter: ModuleEmitter) (ctx: Context) (st: StructuredText) : {| scoped: Scoped; imports: text list; content: text list; docCommentBody: text list |} =
   let renamer = new OverloadRenamer()
   let modules : TextModuleSig list =
     st.children
     |> Map.toList
     |> List.map (fun (k, v) ->
-      let name = Naming.moduleName k |> renamer.Rename "module"
+      let name =
+        let name =
+          if reserved then Naming.moduleNameReserved k
+          else Naming.moduleName k
+        name |> renamer.Rename "module"
       let ctx = ctx |> Context.ofChildNamespace k
-      let result = emitStructuredText moduleEmitter ctx v
+      let result = emitStructuredText reserved moduleEmitter ctx v
       {|
         name = name
         origName = k
@@ -1307,7 +1578,7 @@ let rec private emitStructuredText (moduleEmitter: ModuleEmitter) (ctx: Context)
           | Scoped.Force s -> Some s
           | Scoped.Yes -> Some k
           | Scoped.No -> None
-        content = result.content
+        content = result.imports @ result.content
         docCommentBody = result.docCommentBody
       |}
     )
@@ -1330,7 +1601,6 @@ let rec private emitStructuredText (moduleEmitter: ModuleEmitter) (ctx: Context)
     | None -> Scoped.No
   let content =
     [
-      yield! imports
       yield! emitModules modules
       yield! typedefs
       for item in items do
@@ -1339,9 +1609,10 @@ let rec private emitStructuredText (moduleEmitter: ModuleEmitter) (ctx: Context)
         | Choice2Of2 overloaded -> yield! overloaded renamer
       match st.value with
       | None -> ()
-      | Some v -> yield! emitExportModule ctx v.exports
+      | Some v ->
+        yield! emitExportModule moduleEmitter ctx v.exports
     ]
-  {| scoped = scoped; content = content; docCommentBody = docCommentBody |}
+  {| scoped = scoped; imports = imports; content = content; docCommentBody = docCommentBody |}
 
 let emitFlattenedDefinitions (ctx: Context) (stmts: Statement list) : text list =
   let flags = { EmitTypeFlags.defaultValue with failContravariantTypeVar = true }
@@ -1352,18 +1623,18 @@ let emitFlattenedDefinitions (ctx: Context) (stmts: Statement list) : text list 
 
   let rec go prefix (ctx: Context) (v: Statement) =
     match v with
-    | EnumDef e ->
-      let fn = List.rev (e.name :: ctx.currentNamespace)
+    | Enum e ->
+      let fn = ctx |> Context.getFullName [e.name]
       [
-        yield tprintf "%s %s = " prefix (Naming.flattenedTypeName fn) + GetSelfTyText.enumCases e.cases
+        yield tprintf "%s %s = " prefix (Naming.flattenedTypeName fn.name) + GetSelfTyText.enumCases e e.cases
         for c in e.cases do
-          yield tprintf "and %s = " (Naming.flattenedTypeName (fn @ [c.name])) + GetSelfTyText.enumCases [c]
+          yield tprintf "and %s = " (Naming.flattenedTypeName (fn.name @ [c.name])) + GetSelfTyText.enumCases e [c]
       ]
-    | ClassDef c ->
+    | Class c ->
       match c.name with
-      | None -> [] // anonymous interfaces are treated separately
-      | Some name ->
-        let fn = List.rev (name :: ctx.currentNamespace)
+      | ExportDefaultUnnamedClass -> []
+      | Name name ->
+        let fn = ctx |> Context.getFullName [name]
         let typrm = c.typeParams |> List.map (fun x -> tprintf "'%s" x.name)
         let selfTyText =
           let ctx = ctx |> Context.ofChildNamespace name
@@ -1376,38 +1647,41 @@ let emitFlattenedDefinitions (ctx: Context) (stmts: Statement list) : text list 
               | [] -> Prim prim
               | _  -> App (APrim prim, c.typeParams |> List.map (fun tp -> TypeVar tp.name), UnknownLocation)
             emitType_ ctx target
-        [prefix @+ " " @+ emitTypeName fn typrm +@ " = " + selfTyText]
+        [prefix @+ " " @+ emitTypeName fn.name typrm +@ " = " + selfTyText]
     | TypeAlias { name = name; typeParams = typeParams; target = target } ->
-      let fn = List.rev (name :: ctx.currentNamespace)
+      let fn = ctx |> Context.getFullName [name]
       let typrm = typeParams |> List.map (fun x -> tprintf "'%s" x.name)
       let selfTyText = emitType_ ctx target
-      [prefix @+ " " @+ emitTypeName fn typrm +@ " = " + selfTyText]
+      [prefix @+ " " @+ emitTypeName fn.name typrm +@ " = " + selfTyText]
       // TODO: emit extends of type parameters
     | Module m -> m.statements |> List.collect (go prefix (ctx |> Context.ofChildNamespace m.name))
+    | Global m -> m.statements |> List.collect (go prefix (ctx |> Context.ofRoot))
     | Pattern p ->
       match p with
-      | ImmediateInstance (intf & { name = Some intfName }, value) when Simplify.Has(ctx.options.simplify, Simplify.ImmediateInstance) ->
-        let knownTypesInMembers = Statement.getKnownTypes ctx [ClassDef intf]
+      | ImmediateInstance (intf & { name = Name intfName }, value) when Simplify.Has(ctx.options.simplify, Simplify.ImmediateInstance) ->
+        let knownTypesInMembers = Statement.getKnownTypes ctx [Class intf]
         if intfName <> value.name || knownTypesInMembers |> Set.contains (KnownType.Ident (ctx |> Context.getFullName [intfName])) then
           p.underlyingStatements |> List.collect (go prefix ctx)
         else
           [] // no type is generated for immediate instance
       | ImmediateConstructor (baseIntf, _, _) when Simplify.Has(ctx.options.simplify, Simplify.ImmediateConstructor) ->
-        go prefix ctx (ClassDef baseIntf) // only the base interface is used as a type
+        go prefix ctx (Class baseIntf) // only the base interface is used as a type
       | _ ->
         p.underlyingStatements |> List.collect (go prefix ctx)
     | Import _
-    | Value _
+    | Variable _
+    | Function _
     | Module _
     | Export _
+    | ReExport _
     | UnknownStatement _
     | FloatingComment _ -> []
 
-  let genAnonymousInterface prefix (c: Class) =
+  let genAnonymousInterface prefix (a: AnonymousInterface) =
     let typeName =
       Type.appOpt
-        (anonymousInterfaceToIdentifier ctx c)
-        (c.typeParams |> List.map (fun x -> tprintf "'%s" x.name))
+        (anonymousInterfaceToIdentifier ctx a)
+        (a.typeParams |> List.map (fun x -> tprintf "'%s" x.name))
     let selfTyText = str "private Ojs.t"
     prefix @+ " " @+ typeName +@ " = " + selfTyText
 
@@ -1419,21 +1693,28 @@ let emitFlattenedDefinitions (ctx: Context) (stmts: Statement list) : text list 
         "type"
       else "and"
 
+  let aim =
+   ctx |> Context.tryCurrentSourceInfo (fun info -> info.anonymousInterfacesMap) |> Option.defaultValue Map.empty
+
   List.distinct [
-    for c in ctx.anonymousInterfacesMap |> Map.toList |> List.map fst do
-      yield genAnonymousInterface (getPrefix()) c
+    for a in aim |> Map.toList |> List.map fst do
+      yield genAnonymousInterface (getPrefix()) a
     for stmt in stmts do
       yield! go (getPrefix()) ctx stmt
   ]
 
 let emitStatementsWithStructuredText (ctx: Context) (stmts: Statement list) (st: StructuredText) =
   let moduleEmitter = ModuleEmitter.fromOption ctx.options
-  let result = st |> emitStructuredText moduleEmitter ctx
+  let result = st |> emitStructuredText false moduleEmitter ctx
+  let imports =
+    if List.isEmpty result.imports then []
+    else result.imports @ [empty]
   let content =
     if List.isEmpty result.docCommentBody then result.content
     else
       docComment (concat newline result.docCommentBody) :: result.content
   [
+    yield! imports
     if ctx.options.recModule.IsOffOrDefault then
       yield! emitFlattenedDefinitions ctx stmts
       yield empty
@@ -1447,51 +1728,62 @@ let header =
   [ str "[@@@ocaml.warning \"-7-11-32-33-39\"]"
     Attr.js_implem_floating (str "[@@@ocaml.warning \"-7-11-32-33-39\"]") ]
 
-let emitStdlib (srcs: SourceFile list) (opts: Options) : Output list =
-  Log.tracef opts "* looking up the minimal supported ES version for each definition..."
+let setTyperOptions (ctx: IContext<Options>) =
+  ctx.options.inheritArraylike <- true
+  ctx.options.inheritIterable <- true
+  ctx.options.inheritPromiselike <- true
+  ctx.options.replaceAliasToFunction <- true
+  ctx.options.replaceNewableFunction <- true
+  ctx.options.replaceRankNFunction <- true
+
+let emitStdlib (input: Input) (ctx: IContext<Options>) : Output list =
+  let srcs = input.sources
+
+  ctx.logger.tracef "* looking up the minimal supported ES version for each definition..."
   let esSrc =
     srcs
     |> List.filter (fun src -> src.fileName.Contains("lib.es") && src.fileName.EndsWith(".d.ts"))
-    |> mergeLibESDefinitions
+    |> mergeESLibDefinitions
 
   let domSrc =
-    let stmts =
-      srcs
-      |> List.filter (fun src -> src.fileName.Contains("lib.dom") && src.fileName.EndsWith(".d.ts"))
-      |> List.collect (fun src -> src.statements)
-      |> Statement.merge
-    { fileName = "lib.dom.d.ts"; statements = stmts; references = []; hasNoDefaultLib = false; moduleName = None }
+    srcs
+    |> List.filter (fun src -> src.fileName.Contains("lib.dom") && src.fileName.EndsWith(".d.ts"))
+    |> mergeSources "lib.dom.d.ts"
 
   let webworkerSrc =
-    let stmts =
-      srcs
-      |> List.filter (fun src -> src.fileName.Contains("lib.webworker") && src.fileName.EndsWith(".d.ts"))
-      |> List.collect (fun src -> src.statements)
-      |> Statement.merge
-    { fileName = "lib.webworker.d.ts"; statements = stmts; references = []; hasNoDefaultLib = false; moduleName = None }
+    srcs
+    |> List.filter (fun src -> src.fileName.Contains("lib.webworker") && src.fileName.EndsWith(".d.ts"))
+    |> mergeSources "lib.webworker.d.ts"
+    |> fun src ->
+      let statements =
+        src.statements |> Statement.mapIdent (fun i ->
+          i |> Ident.mapSource (fun path ->
+            // webworker does not depend on DOM but fullnames can still refer to it
+            if path.Contains("lib.dom") && src.fileName.EndsWith(".d.ts") then "lib.webworker.d.ts"
+            else path
+          )
+        )
+      { src with statements = statements }
 
-  Log.tracef opts "* running typer..."
+  ctx.logger.tracef "* running typer..."
+
+  setTyperOptions ctx
+  let opts = ctx.options
   opts.simplify <- [Simplify.All]
   opts.inheritWithTags <- FeatureFlag.Full
   opts.safeArity <- FeatureFlag.Full
   opts.recModule <- RecModule.Optimized
   opts.subtyping <- [Subtyping.Tag]
-  opts.inheritArraylike <- true
-  opts.inheritIterable <- true
-  opts.inheritPromiselike <- true
 
-  let esCtx, esSrc = runAll [esSrc] opts
-  let domCtx, domSrc = runAll [domSrc] opts
-  let webworkerCtx, webworkerSrc = runAll [webworkerSrc] opts
-  assert (esCtx.unknownIdentTypes |> Trie.isEmpty)
-  assert (domCtx.unknownIdentTypes |> Trie.keys |> Seq.forall (fun fn -> Trie.containsKey fn esCtx.definitionsMap))
-  assert (webworkerCtx.unknownIdentTypes |> Trie.keys |> Seq.forall (fun fn -> Trie.containsKey fn esCtx.definitionsMap || Trie.containsKey fn domCtx.definitionsMap))
+  let esCtx, esSrc = runAll [esSrc] ctx
+  let domCtx, domSrc = runAll [domSrc] ctx
+  let webworkerCtx, webworkerSrc = runAll [webworkerSrc] ctx
 
-  let writerCtx ctx =
+  let writerCtx (srcs: SourceFile list) ctx =
     ctx |> Context.mapOptions (fun _ -> opts)
-        |> Context.mapState (fun _ -> State.create ())
+        |> Context.mapState (fun _ -> State.create (srcs |> List.map (fun src -> src.fileName)) (Error None))
 
-  Log.tracef opts "* emitting stdlib..."
+  ctx.logger.tracef "* emitting stdlib..."
 
   let createOutput (fileNameSuffix: string) (opens: string list) ctx (src: SourceFile list) =
     let content =
@@ -1499,7 +1791,8 @@ let emitStdlib (srcs: SourceFile list) (opts: Options) : Output list =
         yield! header
         yield open_ opens
         yield empty
-        yield! emitStatements (writerCtx ctx) (src |> List.collect (fun s -> s.statements))
+        for s in src do
+          yield! emitStatements (writerCtx src ctx |> Context.ofSourceFileRoot s.fileName) s.statements
       ]
     { fileName = sprintf "ts2ocaml_%s.mli" fileNameSuffix; content = content; stubLines = []}
 
@@ -1507,155 +1800,138 @@ let emitStdlib (srcs: SourceFile list) (opts: Options) : Output list =
     { fileName = "ts2ocaml_min.mli"; content = str stdlib; stubLines = []}
 
   [ ts2ocamlMin
-    createOutput  "es" ["Ts2ocaml_min"] esCtx esSrc
+    createOutput "es"  ["Ts2ocaml_min"] esCtx esSrc
     createOutput "dom" ["Ts2ocaml_min"; "Ts2ocaml_es"] domCtx domSrc
     createOutput "webworker" ["Ts2ocaml_min"; "Ts2ocaml_es"] webworkerCtx webworkerSrc ]
-
-let emitImports (stmts: Statement list) : text list =
-  let emitImport (i: Import) =
-    let theirModuleName = i.moduleSpecifier |> Naming.jsModuleNameToOCamlModuleName
-
-    let isModule (name: string) (kind: Set<Kind> option) =
-      i.isTypeOnly
-      || kind |> Option.map (fun k -> Set.intersect k (Set.ofList [Kind.Type; Kind.ClassLike; Kind.Module]) |> Set.isEmpty |> not)
-              |> Option.defaultValue false
-      || name |> Naming.isCase Naming.Case.PascalCase
-
-    let emitES6Import (b: {| name: string; kind: Set<Kind> option; renameAs: string option |}) =
-      if isModule b.name b.kind then
-        let theirName = b.name |> Naming.moduleName
-        let ourName =
-          match b.renameAs with
-          | Some name -> name |> Naming.moduleName
-          | None -> theirName
-        tprintf "module %s = %s.Export.%s " ourName theirModuleName theirName |> Some
-      else
-        None
-
-    let stopStartImplem text =
-      Attr.js_stop_start_implem_oneliner text text
-
-    [ yield empty
-      yield commentStr i.origText
-      match i.clause with
-      | ES6WildcardImport ->
-        yield open_ [ sprintf "%s.Export" theirModuleName ]
-      | NamespaceImport x ->
-        yield tprintf "module %s = %s.Export" (Naming.moduleName x.name) theirModuleName |> stopStartImplem
-      | ES6Import x ->
-        match x.defaultImport with
-        | None -> ()
-        | Some b ->
-          if isModule b.name b.kind then
-            let ourName = b.name |> Naming.moduleName
-            yield tprintf "module %s = %s.Export.Default" ourName theirModuleName |> stopStartImplem
-        for b in x.bindings do
-          match emitES6Import b with Some t -> yield stopStartImplem t | None -> () ]
-
-  stmts |> List.collect (function Import i -> emitImport i | _ -> [])
 
 let handleExports moduleName (ctx: Context) (str: StructuredText) : {| stubLines: string list; topLevelScope: string option |} =
   let stubBinding xs expr =
     let specifier = xs |> List.map (fun n -> sprintf "[\"%s\"]" (String.escape n)) |> String.concat ""
     sprintf "joo_global_object%s = %s" specifier expr
 
-  let createStubLine prefix (x: {| expr: string; needBabel: bool; target: IdentType |}) =
-    match x.target.fullName with
+  let createStubLine prefix (x: {| expr: string; needBabel: bool; target: Ident |}) =
+    match x.target.fullName |> List.tryFind (fun fn -> fn.source = ctx.currentSourceFile) with
     | None ->
-      Log.warnf ctx.options "cannot generate stub for importing '%s' at %s" (x.target.name |> String.concat ".") (x.target.loc.AsString)
+      ctx.logger.warnf "cannot generate stub for importing '%s' at %s" (x.target.name |> String.concat ".") (x.target.loc.AsString)
       None
-    | Some fn -> Some (stubBinding (prefix @ fn) x.expr)
+    | Some fn -> Some (stubBinding (prefix @ fn.name) x.expr)
 
   match str.value with
   | None -> {| stubLines = []; topLevelScope = None |}
   | Some v ->
     let stubLines, topLevelScope =
-      match v.exports |> List.tryFind (fun e -> match e.clause with CommonJsExport _ -> true | _ -> false) with
-      | Some commonJsExport ->
-        ExportClause.require moduleName commonJsExport.clause |> List.choose (createStubLine []), None
-      | None ->
-        let boundExports =
-          v.exports |> List.filter (fun e -> e.kind |> Set.contains Kind.Value)
-        let es6Exports = boundExports |> List.filter (fun e -> match e.clause with ES6Export _ | ES6DefaultExport _ -> true | _ -> false)
-        if List.isEmpty es6Exports then [], None
-        else
-          let defaultExport =
-            es6Exports |> List.tryFind (fun e -> match e.clause with ES6DefaultExport _ -> true | _ -> false)
-          let stubLines = [
-            yield stubBinding [moduleName] (sprintf "require('%s') /* need Babel */" moduleName)
-            match defaultExport with
-            | None -> ()
-            | Some e ->
-              yield!
-                e.clause
-                |> ExportClause.require moduleName
-                |> List.choose (createStubLine [moduleName])
-          ]
-          stubLines, Some moduleName
-    {| stubLines = stubLines; topLevelScope = topLevelScope |}
+      v.exports |> List.fold (fun (stubLines, topLevelScope) export ->
+        match export with
+        | ExportItem.DefaultUnnamedClass _ ->
+          stubBinding [moduleName; Naming.exportDefaultClassStubName] (sprintf "require('%s').default /* need Babel */" moduleName) :: stubLines,
+          Some moduleName
+        | ExportItem.ReExport _ -> stubLines, topLevelScope // no stub line needed for re-exports
+        | ExportItem.Export e ->
+          e.clauses |> List.fold (fun (stubLines, topLevelScope) -> function
+            | (CommonJsExport _ as clause, _) ->
+              let stub =
+                ExportClause.require moduleName clause
+                |> List.choose (fun x -> createStubLine [] {| x with needBabel = false |})
+              List.rev stub @ stubLines, topLevelScope
+            | (ES6DefaultExport _ as clause, kind) when kind |> Set.contains Kind.Value ->
+              let stub =
+                ExportClause.require moduleName clause
+                |> List.choose (fun x -> createStubLine [moduleName] {| x with needBabel = true |})
+              List.rev stub @ stubLines, Some moduleName
+            | (ES6Export _, kind) when kind |> Set.contains Kind.Value ->
+              let stub =
+                stubBinding [moduleName] (sprintf "require('%s') /* need Babel */" moduleName)
+              stub :: stubLines, Some moduleName
+            | _ -> stubLines, topLevelScope
+          ) (stubLines, topLevelScope)
+      ) ([], None)
+    {| stubLines = stubLines |> List.rev |> List.distinct; topLevelScope = topLevelScope |}
 
-let emitReferenceTypeDirectives (src: SourceFile) : text list =
+let emitReferenceTypeDirectives (ctx: Context) (src: SourceFile) : text list =
   let refs =
     src.references
     |> List.choose (function TypeReference r -> Some r | _ -> None)
-
   if List.isEmpty refs then []
   else
     let comments =
       refs
       |> List.map (sprintf "<reference types=\"%s\">")
       |> List.map commentStr
-
     let openRefs =
       refs
       |> List.map Naming.jsModuleNameToOCamlModuleName
       |> open_
-
     empty :: comments @ [openRefs]
 
-let emitEverythingCombined (srcs: SourceFile list) (opts: Options) : Output list =
-  if srcs = [] then failwith "no input files were given"
+let emitReferenceFileDirectives (ctx: Context) (src: SourceFile) : text list =
+  let refs =
+    src.references
+    |> List.choose (function FileReference r -> Some r | _ -> None)
+  if List.isEmpty refs then []
+  else
+    // if the referenced file is included in the input files, skip emitting it
+    let validRefs =
+      refs
+      |> List.choose (fun ref ->
+        let relativePath = Path.join [Path.dirname src.fileName; ref]
+        if ctx.state.fileNames |> List.contains relativePath |> not then
+          Some {| path = ref; relativePath = relativePath |}
+        else None)
+    let comments =
+      refs
+      |> List.map (sprintf "<reference path=\"%s\">")
+      |> List.map commentStr
+    let openRefs =
+      validRefs
+      |> List.choose (fun x ->
+        JsHelper.deriveModuleName (Result.toOption ctx.state.info) [x.relativePath]
+        |> JsHelper.InferenceResult.tryUnwrap
+        |> Option.map Naming.jsModuleNameToOCamlModuleName)
+      |> open_
+    empty :: comments @ [openRefs]
 
-  let srcs =
-    match srcs with
-    | [] | _ :: [] -> srcs
-    | _ ->
-      let combinedName, moduleName =
-        match srcs |> List.tryFind (fun src -> src.fileName.EndsWith "index.d.ts") with
-        | Some index ->
-          Log.tracef opts "* using index.d.ts as an entrypoint"
-          index.fileName, index.moduleName
-        | None ->
-          Log.tracef opts "* treating everything as combined into lib.d.ts"
-          "lib.d.ts", None
-      [
-        { fileName = combinedName
-          statements = srcs |> List.collect (fun src -> src.statements)
-          references = srcs |> List.collect (fun src -> src.references) |> List.distinct
-          hasNoDefaultLib = srcs |> List.exists (fun src -> src.hasNoDefaultLib)
-          moduleName = moduleName }
-      ]
+let private emitImpl (sources: SourceFile list) (info: PackageInfo option) (ctx: IContext<Options>) =
+  let derivedOutputFileName =
+    let inline log x =
+      ctx.logger.tracef "* the inferred output file name is '%s'" x
+      x
+    JsHelper.deriveModuleName info (sources |> List.map (fun s -> s.fileName))
+    |> JsHelper.InferenceResult.tryUnwrap
+    |> Option.map (Naming.jsModuleNameToFileName >> log)
+    |> Option.defaultWith (fun () ->
+      ctx.logger.warnf "* the output file name cannot be inferred. 'output.mli' is used instead."
+      "output.mli")
 
-  let moduleName =
-    let indexFile =
-      srcs |> List.tryFind (fun src -> src.fileName.EndsWith "index.d.ts")
-           |> Option.defaultWith (fun () -> List.head srcs)
-    Naming.getJsModuleName indexFile.fileName
-  let derivedOutputFileName = moduleName |> Naming.jsModuleNameToFileName
+  let derivedModuleName =
+    JsHelper.deriveModuleName info (sources |> List.map (fun s -> s.fileName))
+    |> JsHelper.InferenceResult.unwrap "package"
 
-  Log.tracef opts "* the inferred output file name is '%s'" derivedOutputFileName
+  let fileNames = sources |> List.map (fun s -> s.fileName)
 
-  Log.tracef opts "* running typer..."
-  let ctx, srcs = runAll srcs opts
+  let info =
+    match info with
+    | Some info -> Ok info
+    | None -> Error (Some derivedModuleName)
+
+  let sources, mergedFileName =
+    match sources with
+    | [] -> failwith "impossible_emitImpl (empty sources)"
+    | [src] -> [src], src.fileName
+    | _ -> [mergeSources "input.d.ts" sources], "input.d.ts"
+
+  ctx.logger.tracef "* running typer..."
+  setTyperOptions ctx
+  let ctx, sources = runAll sources ctx
+
   let ctx =
-    ctx |> Context.mapOptions (fun _ -> opts)
-        |> Context.mapState (fun _ -> State.create ())
-  let stmts = srcs |> List.collect (fun x -> x.statements)
+    ctx
+    |> Context.mapState (fun _ -> State.create fileNames info)
+    |> Context.ofSourceFileRoot mergedFileName
+  let stmts = sources |> List.collect (fun x -> x.statements)
   let structuredText = createStructuredText ctx stmts
+  let exported = handleExports derivedModuleName ctx structuredText
 
-  let exported = handleExports moduleName ctx structuredText
-
-  Log.tracef opts "* emitting a binding for js_of_ocaml..."
+  ctx.logger.tracef "* emitting a binding to '%s' for js_of_ocaml..." derivedModuleName
   let content =
     concat newline [
       yield! header
@@ -1664,13 +1940,20 @@ let emitEverythingCombined (srcs: SourceFile list) (opts: Options) : Output list
       | Some scope ->
         yield tprintf "[@@@js.scope \"%s\"]" scope
 
-      yield open_ [ "Ts2ocaml"; "Ts2ocaml.Dom"; "Ts2ocaml.WebWorker" ]
-      yield! emitImports stmts
-      for src in srcs do
-        yield! emitReferenceTypeDirectives src
+      yield open_ [ "Ts2ocaml"; "Ts2ocaml.Dom"; ]
+      for src in sources do
+        yield! emitReferenceTypeDirectives ctx src
+        yield! emitReferenceFileDirectives ctx src
 
       yield empty
       yield! emitStatementsWithStructuredText ctx stmts structuredText
     ]
 
-  [{ fileName = derivedOutputFileName; content = content; stubLines = exported.stubLines }]
+  { fileName = derivedOutputFileName; content = content; stubLines = exported.stubLines }
+
+let emit (input: Input) (ctx: IContext<Options>) : Output list =
+  if ctx.options.merge then
+    [emitImpl input.sources input.info ctx]
+  else
+    input.sources
+    |> List.map (fun source -> emitImpl [source] input.info ctx)

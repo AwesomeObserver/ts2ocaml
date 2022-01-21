@@ -1,6 +1,7 @@
 module Targets.JsOfOCaml.Common
 
 open Fable.Core
+open Ts2Ml
 open DataTypes
 
 [<StringEnum; RequireQualifiedAccess>]
@@ -78,6 +79,7 @@ type Options =
   abstract recModule: RecModule with get, set
   abstract safeArity: FeatureFlag with get, set
   abstract simplify: Simplify list with get, set
+  abstract readableNames: bool with get, set
 
 module Options =
   open Fable.Core.JsInterop
@@ -92,12 +94,12 @@ module Options =
       | Some p ->
         Log.tracef opts "* using the preset '%s'." !!p
 
-        if opts.simplify = [] then
-          opts.simplify <- [Simplify.All]
         let subtypingIsDefault =
           opts.subtyping = []
 
-        if p = Preset.Minimal || p = Preset.Full then
+        if p = Preset.Minimal || p = Preset.Safe || p = Preset.Full then
+          if opts.simplify = [] then
+            opts.simplify <- [Simplify.All]
           if opts.recModule = RecModule.Default then
             opts.recModule <- RecModule.Optimized
 
@@ -146,7 +148,7 @@ module Options =
         (fun (o: Options) -> o.preset),
         descr="Specify the preset to use."
       )
-
+      .group(!^ResizeArray[], "Parser Options:")
       .group(
         !^ResizeArray[
           "output-dir"; "stub-file"
@@ -198,6 +200,7 @@ module Options =
           "safe-arity";
           "rec-module";
           "simplify";
+          "human-readable-anonymous-interface-names"
         ],
         "Code Generator Options:")
       .addChoice(
@@ -219,6 +222,12 @@ module Options =
         descr=
           sprintf "Turn on simplification features. Available features: %s"
                   (Simplify.Values |> Array.map string |> String.concat ", "))
+      .addFlag(
+        "readable-names",
+        (fun (o: Options) -> o.readableNames),
+        descr="Try to use more readable names instead of AnonymousInterfaceN.",
+        defaultValue = false
+      )
 
       .middleware(!^validate)
 

@@ -14,16 +14,15 @@ jobs:
         dotnet:
           - 5.0.x
         node-version:
-          - 14.x
+          - 16.x
         ocaml-compiler:
-          - 4.12.x
+          - 4.13.x
 
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v2
-        with:
-          submodules: 'recursive'
+      - name: Checkout code
+        uses: actions/checkout@v2
 
       - name: Use .NET ${{ matrix.dotnet }}
         uses: actions/setup-dotnet@v1
@@ -31,9 +30,10 @@ jobs:
           dotnet-version: ${{ matrix.dotnet }}
 
       - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v2.1.5
+        uses: actions/setup-node@v2
         with:
           node-version: ${{ matrix.node-version }}
+          cache: yarn
 
       - name: Use OCaml ${{ matrix.ocaml-compiler }}
         uses: ocaml/setup-ocaml@v2
@@ -45,10 +45,8 @@ jobs:
         run: dotnet restore
            | dotnet tool restore
 
-      - name: Pin the latest gen_js_api
-        run: opam pin add gen_js_api https://github.com/LexiFi/gen_js_api.git -y
       - name: Install OCaml Dependencies
-        run: opam install js_of_ocaml gen_js_api -y
+        run: opam install . --deps-only
 
       - name: Run FAKE
         run: dotnet fake build target All
@@ -64,9 +62,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MESSAGE: "Build ({sha}) {msg}"
 
-      - name: NPM Publish
-        if: success()
+      - name: NPM Publish as "latest"
+        if: success() && !github.event.release.prerelease
         uses: JS-DevTools/npm-publish@v1
         with:
           token: ${{ secrets.NPM_TOKEN }}
           check-version: true
+
+      - name: NPM Publish as "beta"
+        if: success() && github.event.release.prerelease
+        uses: JS-DevTools/npm-publish@v1
+        with:
+          token: ${{ secrets.NPM_TOKEN }}
+          check-version: true
+          tag: "beta"

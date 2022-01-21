@@ -294,9 +294,13 @@ __pycache__/
 .ionide
 .ignored
 
+# opam local switch
+_opam/
+
 # Outputs
 output
 *.fs.js*
+output*.txt
 
 # Test artifacts
 test/jsoo/src/*.mli

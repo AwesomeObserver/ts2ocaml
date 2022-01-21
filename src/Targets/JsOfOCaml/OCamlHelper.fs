@@ -1,6 +1,7 @@
 module Targets.JsOfOCaml.OCamlHelper
 
 open System
+open Ts2Ml
 open Syntax
 open Targets.JsOfOCaml.Common
 open DataTypes
@@ -24,9 +25,6 @@ let docComment text =
 let docCommentStr text =tprintf "(** %s *)" text
 
 let [<Literal>] pv_head = "`"
-
-[<Obsolete("TODO")>]
-let inline TODO<'a> = failwith "TODO"
 
 [<RequireQualifiedAccess>]
 module Attr =
@@ -141,7 +139,7 @@ module Type =
     | xs -> concat sep xs |> between "(" ")"
 
   let tuple = many (str " * ")
-  let arrow = many (str " -> ")
+  let arrow xs = concat (str " -> ") xs
 
   let app t = function
     | [] -> failwith "type application with empty arguments"
@@ -270,6 +268,10 @@ let typeAlias name tyargs ty =
   + (if List.isEmpty tyargs then str name else Type.app (str name) tyargs)
   +@ " = " + ty
 
+let moduleAlias name target =
+  let text = tprintf "module %s = %s" name target
+  Attr.js_stop_start_implem_oneliner text text
+
 let val_ name ty =
   tprintf "val %s: " name + ty
 
@@ -327,14 +329,16 @@ module Naming =
       "Export"; "Default"
     ] |> Set.union Naming.Keywords.keywords
 
-  let moduleName (name: string) =
+  let moduleNameReserved (name: string) =
     let name = removeInvalidChars name
-    let result =
-      if Char.IsLower name.[0] then
-        sprintf "%c%s" (Char.ToUpper name.[0]) name.[1..]
-      else if name.[0] = '_' then
-        "M" + name
-      else name
+    if Char.IsLower name.[0] then
+      sprintf "%c%s" (Char.ToUpper name.[0]) name.[1..]
+    else if name.[0] = '_' then
+      "M" + name
+    else name
+
+  let moduleName (name: string) =
+    let result = moduleNameReserved name
     if reservedModuleNames |> Set.contains result then result + "_" else result
 
   let constructorName (name: string list) =
@@ -366,18 +370,39 @@ module Naming =
       else sprintf "%s_%d" name arity
     | None -> sprintf "%s_%d" name arity
 
+  let private jsModuleNameToOCamlName (jsModuleName: string) =
+    match jsModuleName.TrimStart('@') |> String.splitThenRemoveEmptyEntries "/" |> Array.toList with
+    | xs ->
+      xs
+      |> List.map (fun n ->
+        n |> Naming.toCase Naming.Case.LowerSnakeCase)
+      |> String.concat "__"
+
   let jsModuleNameToFileName (jsModuleName: string) =
     jsModuleName
-    |> String.split "/"
-    |> Array.map (fun n ->
-      n |> Naming.toCase Naming.Case.LowerSnakeCase)
-    |> String.concat "__"
+    |> jsModuleNameToOCamlName
     |> sprintf "%s.mli"
 
   let jsModuleNameToOCamlModuleName (jsModuleName: string) =
     jsModuleName
-    |> String.split "/"
-    |> Array.map (fun n ->
-      n |> Naming.toCase Naming.Case.LowerSnakeCase)
-    |> String.concat "__"
+    |> jsModuleNameToOCamlName
     |> moduleName
+
+  let exportDefaultClassStubName = "__export_default_class__"
+
+module Kind =
+  let generatesOCamlModule kind =
+    Set.intersect kind (Set.ofList [Kind.Type; Kind.ClassLike; Kind.Module]) |> Set.isEmpty |> not
+
+let jsBuilder name (fields: {| isOptional: bool; name: string; value: text |} list) (thisType: text) =
+  let args =
+    fields
+    |> List.map (fun f ->
+      let prefix = if f.isOptional then str "?" else empty
+      let name = Naming.valueName f.name
+      let value =
+        if name = f.name then f.value
+        else
+          between "(" ")" (f.value + tprintf "[@js \"%s\"]" f.name)
+      prefix +@ name +@ ":" + value)
+  tprintf "val %s: " name + Type.arrow (args @ [Type.void_; thisType]) +@ " [@@js.builder]"
