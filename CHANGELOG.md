@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0-beta.5]
+- Changed the representation of untagged union types and intersection types to make it easier to use.
+  - `('a, 'b) and_` and `('a, 'b) or_` types are removed in this change.
+  - This is a breaking change.
+- Union types appearing as argument of function are now emitted in a simpler form: `` [`U1 of t1 | `U2 of t2 | .. ] [@js.union] ``.
+  - Now you don't have to do `Union.inject_n` on function arguments.
+  - This is a breaking change.
+- Union of primitive types are now represented as `[...] Primitive.t`.
+  - Use `Primitive.classify` function to convert it to a polymorphic variant, on which you can `match` directly.
+  - `'a or_XXX` types are removed in this change.
+  - This is a breaking change.
+
 ## [1.4.0-beta.4] - 2022-01-21
 - Ts2ocaml now emits builder function `[@js.builder]` for POJO interfaces.
 

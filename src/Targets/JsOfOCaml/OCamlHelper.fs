@@ -85,13 +85,39 @@ module Attr =
 [<RequireQualifiedAccess>]
 module Type =
   // prim types that are JS-able and defined as interface in typescript/lib/lib.*.d.ts
-  let jsablePrimTypeInterfaces =
+  let jsablePrimitives =
     Map.ofList [
       "Array",   Array
       "ReadonlyArray", Array
+      "ArrayLike", Array
+      "Number", Number
+      "String", String
+      "Boolean", Bool
     ]
 
-  let nonJsablePrimTypeInterfaces =
+  // these types don't really defined as interface, but have "boxed" interfaces.
+  // these interfaces have `constructor(any)` to box, and `valueOf()` to unbox.
+  // however, methods defined in those interfaces are still present even in "unboxed" form.
+  let jsableBoxedPrimitives =
+    Map.ofList [
+      "Number", Number
+      "String", String
+      "Boolean", Bool
+    ]
+
+  // these types have different JS representation than in OCaml,
+  // so it should be avoided to appear as type arguments.
+  let nonIdentityPrimitives =
+    Map.ofList [
+      "Array",   Array
+      "ReadonlyArray", Array
+      "ArrayLike", Array
+      "String", String
+      "Boolean", Bool
+    ]
+
+  // prim types that are NOT JS-able and defined as interface in typescript/lib/lib.*.d.ts
+  let nonJsablePrimitives =
     Map.ofList [
       "Object", Object
       "Function", UntypedFunction
@@ -100,37 +126,7 @@ module Type =
       "BigInt", BigInt
     ]
 
-  // JS-able OCaml types
-  let void_ = str "unit"
-  let string  = str "string"
-  let boolean = str "bool"
-  let number (opt: Options) =
-    if opt.numberAsInt then str "int"
-    else str "float"
-  let array   = str "list"
-  let readonlyArray = str "list"
-
-  // JS only types
-  // ES5
-  let object  = str "untyped_object"
-  let function_ = str "untyped_function"
-  let symbol  = str "symbol"
-  let regexp  = str "regexp"
-  // ES2020
-  let bigint = str "bigint"
-
-  // TS types
-  let never   = str "never"
-  let any     = str "any"
-  let unknown = str "unknown"
-  let null_          = str "or_null"
-  let undefined      = str "or_undefined"
-  let null_undefined = str "or_null_or_undefined"
-
-  // gen_js_api types
-  let ojs_t = str "Ojs.t"
-
-  // our types
+  // basic type expressions
   let var s = tprintf "'%s" s
 
   let many sep = function
@@ -150,37 +146,52 @@ module Type =
     if List.isEmpty args then t
     else app t args
 
+  // JS-able OCaml types
+  let void_ = str "unit"
+  let string  = str "string"
+  let boolean = str "bool"
+  let number (opt: Options) =
+    if opt.numberAsInt then str "int"
+    else str "float"
+  let array = str "list"
+  let readonlyArray = str "list"
+  let option t = app (str "option") [t]
+
+  // JS only types
+  // ES5
+  let object  = str "untyped_object"
+  let function_ = str "untyped_function"
+  let symbol  = str "symbol"
+  let regexp  = str "regexp"
+  let null_ = str "null"
+  let undefined = str "undefined"
+  // ES2020
+  let bigint = str "bigint"
+
+  // TS types
+  let never   = str "never"
+  let any     = str "any"
+  let unknown = str "unknown"
+
+  // gen_js_api types
+  let ojs_t = str "Ojs.t"
+
+  // our types
   let intf  = str "intf"
 
-  let and_ a b = app (str "and_") [a; b]
-  let or_  a b = app (str "or_")  [a; b]
+  let rec union = function
+    | [] -> failwith "union type with zero elements"
+    | x :: [] -> x
+    | x1 :: x2 :: x3 :: x4 :: x5 :: x6 :: x7 :: x8 :: rest ->
+      app (str "union8") [x1; x2; x3; x4; x5; x6; x7; union (x8 :: rest)]
+    | xs -> app (tprintf "union%i" (List.length xs)) xs
 
-  let string_or t  = app (str "or_string") [t]
-  let number_or t  = app (str "or_number") [t]
-  let boolean_or t = app (str "or_boolean") [t]
-  let symbol_or t  = app (str "or_symbol") [t]
-  let bigint_or t  = app (str "or_bigint") [t]
-
-  let array_or elemT t = app (str "or_array") [t; elemT]
-  let enum_or cases t = app (str "or_enum") [t; cases]
-
-  let union types =
-    let l = List.length types
-    if l < 1 then failwith "union type with only zero or one type"
-    else
-      let rec go i = function
-        | h :: t when i > 8 -> or_ (go (i-1) t) h
-        | xs -> app (tprintf "union%i" i) xs
-      go l types
-
-  let intersection types =
-    let l = List.length types
-    if l < 1 then failwith "union type with only zero or one type"
-    else
-      let rec go i = function
-        | h :: t when i > 8 -> and_ (go (i-1) t) h
-        | xs -> app (tprintf "intersection%i" i) xs
-      go l types
+  let rec intersection = function
+    | [] -> failwith "intersection type with zero elements"
+    | x :: [] -> x
+    | x1 :: x2 :: x3 :: x4 :: x5 :: x6 :: x7 :: x8 :: rest ->
+      app (str "intersection8") [x1; x2; x3; x4; x5; x6; x7; intersection (x8 :: rest)]
+    | xs -> app (tprintf "intersection%i" (List.length xs)) xs
 
 [<RequireQualifiedAccess>]
 module Term =

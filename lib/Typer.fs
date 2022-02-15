@@ -1322,6 +1322,13 @@ module ResolvedUnion =
     ]
     cases |> String.concat " | "
 
+  let checkNullOrUndefined (u: UnionType) : {| hasNull: bool; hasUndefined: bool; rest: Type list |} =
+    let nullOrUndefined, rest =
+      u.types |> List.partition (function Prim (Null | Undefined) -> true | _ -> false)
+    let hasNull = nullOrUndefined |> List.contains (Prim Null)
+    let hasUndefined = nullOrUndefined |> List.contains (Prim Undefined)
+    {| hasNull = hasNull; hasUndefined = hasUndefined; rest = rest |}
+
   let rec private getEnumFromUnion ctx (u: UnionType) : Set<Choice<Enum * EnumCase, Literal>> * UnionType =
     let (|Dummy|) _ = []
 
@@ -1329,20 +1336,29 @@ module ResolvedUnion =
       seq {
         match t with
         | Union { types = types } -> yield! Seq.collect go types
-        | Intersection { types = types } -> yield! types |> List.map (go >> Set.ofSeq) |> Set.intersectMany |> Set.toSeq
+        | Intersection { types = types } ->
+          let cases = types |> List.map (go >> Set.ofSeq) |> Set.intersectMany
+          if Set.isEmpty cases then yield Choice2Of2 t
+          else yield! cases
         | (Ident ({ loc = loc } & i) & Dummy tyargs)
         | App (AIdent i, tyargs, loc) ->
-          for x in i |> Ident.getDefinitions ctx do
-            match x with
+          let finder = function
             | Definition.TypeAlias a ->
               let bindings = Type.createBindings i.name loc a.typeParams tyargs
-              yield! go (a.target |> Type.substTypeVar bindings ())
+              go (a.target |> Type.substTypeVar bindings ())
             | Definition.Enum e ->
-              for c in e.cases do yield Choice1Of2 (Choice1Of2 (e, c))
+              e.cases |> Seq.map (fun c -> Choice1Of2 (Choice1Of2 (e, c)))
             | Definition.EnumCase (c, e) ->
-              yield Choice1Of2 (Choice1Of2 (e, c))
-            | Definition.Class _ -> yield Choice2Of2 t
-            | _ -> ()
+              Seq.singleton (Choice1Of2 (Choice1Of2 (e, c)))
+            | _ -> Seq.empty
+          let result =
+            i |> Ident.getDefinitions ctx
+              |> List.tryPick (fun d ->
+                let e = finder d
+                if Seq.isEmpty e then None else Some e)
+          match result with
+          | Some e -> yield! e
+          | None -> yield Choice2Of2 t
         | TypeLiteral l -> yield Choice1Of2 (Choice2Of2 l)
         | _ -> yield Choice2Of2 t
       }
@@ -1474,10 +1490,10 @@ module ResolvedUnion =
         |> Map.toList
         |> List.choose (fun (name, values) ->
           match tagDict.TryGetValue(name) with
-          | true, (i, commonValues) ->
+          | true, (i, commonValues) when values <> commonValues -> // reject the tag if it does not discriminate at all
             let intersect = Set.intersect values commonValues
             Some ((-(Set.count intersect), i), (name, values)) // prefer the tag with the least intersections
-          | false, _ -> None)
+          | _, _ -> None)
       if List.isEmpty xs then None
       else Some (xs |> List.maxBy fst |> snd)
 
@@ -1489,7 +1505,7 @@ module ResolvedUnion =
       ) discriminatables ([], rest)
 
     if List.length discriminatables < 2 then
-      Map.empty, { u with types = List.distinct u.types }
+      Map.empty, u
     else
       let dus =
         discriminatables
@@ -1514,12 +1530,9 @@ module ResolvedUnion =
     match resolveUnionMap |> Map.tryFind u with
     | Some t -> t
     | None ->
-      let nullOrUndefined, rest =
-        u.types |> List.partition (function Prim (Null | Undefined) -> true | _ -> false)
-      let caseNull = nullOrUndefined |> List.contains (Prim Null)
-      let caseUndefined = nullOrUndefined |> List.contains (Prim Undefined)
+      let u' = checkNullOrUndefined u
       let prims, arrayTypes, rest =
-        rest |> List.fold (fun (prims, ats, rest) ->
+        u'.rest |> List.fold (fun (prims, ats, rest) ->
           function
           | Prim Number -> Typeofable.Number  :: prims, ats, rest
           | Prim String -> Typeofable.String  :: prims, ats, rest
@@ -1533,19 +1546,26 @@ module ResolvedUnion =
       let caseArray =
         if List.isEmpty arrayTypes then None
         else Some (Set.ofList arrayTypes)
-      let caseEnum, rest =
+      let caseEnum, rest' =
         match rest with
         | _ :: _ :: _ -> getEnumFromUnion ctx { types = rest }
         | _ -> Set.empty, { types = rest }
-      let discriminatedUnions, rest =
-        match rest.types with
-        | _ :: _ :: _ -> getDiscriminatedFromUnion ctx rest
-        | _ -> Map.empty, rest
-      let otherTypes = Set.ofList rest.types
+      let discriminatedUnions, rest'' =
+        match rest'.types with
+        | _ :: _ :: _ -> getDiscriminatedFromUnion ctx rest'
+        | _ -> Map.empty, rest'
+      let otherTypes = Set.ofList rest''.types
+
+      if not u'.hasNull && not u'.hasUndefined && Set.isEmpty typeofableTypes && caseArray = None
+         && Set.isEmpty caseEnum && Map.isEmpty discriminatedUnions && Set.isEmpty otherTypes then
+        eprintfn "[0] %A" rest
+        eprintfn "[1] %A" rest'
+        eprintfn "[2] %A" rest''
+        failwith "error!!!!!!!!!!!!!"
 
       let result =
-        { caseNull = caseNull
-          caseUndefined = caseUndefined
+        { caseNull = u'.hasNull
+          caseUndefined = u'.hasUndefined
           typeofableTypes = typeofableTypes
           caseArray = caseArray
           caseEnum = caseEnum
