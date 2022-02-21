@@ -127,28 +127,11 @@ let toCase (case: Case) (str: string) =
   | _, _ -> wordsToCase case words
 
 module Keywords =
-  let keywords =
-    Set.ofList [
-      "and"; "as"; "assert"; "asr"; "begin"; "class";
-      "constraint"; "do"; "done"; "downto"; "else"; "end";
-      "exception"; "external"; "false"; "for"; "fun"; "function";
-      "functor"; "if"; "in"; "include"; "inherit"; "initializer";
-      "land"; "lazy"; "let"; "lor"; "lsl"; "lsr";
-      "lxor"; "match"; "method"; "mod"; "module"; "mutable";
-      "new"; "nonrec"; "object"; "of"; "open"; "or";
-      "private"; "rec"; "sig"; "struct"; "then"; "to";
-      "true"; "try"; "type"; "val"; "virtual"; "when";
-      "while"; "with"
-    ]
-
   let esKeywords =
     Set.ofList [
       "Readonly"; "Partial"; "Pick";
       "HTMLDialogElement"; "HTMLWebViewElement"
     ]
-
-  let primitives = Set.ofList [ "string"; "obj"; "unit"; "float"; "bool"; "int" ]
-  let basicTypes = Set.ofList [ "list"; "array"; "option" ]
 
 let removeQuotesAndTrim (s: string) =
   if String.IsNullOrEmpty s then ""

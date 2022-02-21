@@ -132,9 +132,7 @@ type EmitTypeFlags = {
   skipAttributesOnContravariantPosition: bool
   avoidTheseArgumentNames: Set<string>
   forceVariadic: bool
-  hasTypeArgumentsHandled: bool
   forceSkipAttributes: bool
-  convertNonIdentityPrimitives: bool
   simplifyContravariantUnion: bool
 }
 
@@ -148,9 +146,7 @@ module EmitTypeFlags =
       skipAttributesOnContravariantPosition = false
       avoidTheseArgumentNames = Set.empty
       forceVariadic = false
-      hasTypeArgumentsHandled = false
       forceSkipAttributes = false
-      convertNonIdentityPrimitives = false
       simplifyContravariantUnion = false
     }
 
@@ -193,7 +189,7 @@ let rec emitTypeImpl (flags: EmitTypeFlags) (overrideFunc: OverrideFunc) (ctx: C
   let forceSkipAttr text = if flags.forceSkipAttributes then empty else text
   let treatIdent (i: Ident) (tyargs: Type list) (loc: Location) =
     let arity = List.length tyargs
-    let flagsForArgs = { flags with needParen = true; forceVariadic = false; convertNonIdentityPrimitives = true }
+    let flagsForArgs = { flags with needParen = true; forceVariadic = false }
     let withTyargs ty =
       Type.appOpt ty (tyargs |> List.map (emitTypeImpl flagsForArgs overrideFunc ctx))
     let origin =
@@ -276,7 +272,7 @@ let rec emitTypeImpl (flags: EmitTypeFlags) (overrideFunc: OverrideFunc) (ctx: C
       commentStr (sprintf "FIXME: type '%s' cannot be used for variadic argument" (Type.pp ty)) + Type.app Type.array [Type.any]
     | App (t, ts, loc) ->
       let emit t ts =
-        Type.appOpt (emitTypeImpl { flags with hasTypeArgumentsHandled = true } overrideFunc ctx t) (List.map (emitTypeImpl { flags with needParen = true } overrideFunc ctx) ts)
+        Type.appOpt (emitTypeImpl flags overrideFunc ctx t) (List.map (emitTypeImpl { flags with needParen = true } overrideFunc ctx) ts)
       match t with
       | AIdent i -> treatIdent i ts loc
       | APrim _ | AAnonymousInterface _ -> emit (Type.ofAppLeftHandSide t) ts
