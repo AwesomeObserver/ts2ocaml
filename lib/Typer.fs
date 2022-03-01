@@ -83,6 +83,10 @@ type AnonymousInterfaceInfo = {
   origin: AnonymousInterfaceOrigin
 }
 
+type [<RequireQualifiedAccess>] KnownType =
+  | Ident of fullName:FullName
+  | AnonymousInterface of AnonymousInterface * AnonymousInterfaceInfo
+
 type SourceFileInfo = {
   sourceFile: SourceFile
   definitionsMap: Trie<string, Definition list>
@@ -661,6 +665,19 @@ module Type =
   let getAllInheritancesAndSelf ctx ty = getAllInheritancesImpl 0 true ctx ty |> removeDuplicatesFromInheritingTypes
   let getAllInheritancesAndSelfFromName ctx fn = getAllInheritancesFromNameImpl 0 true ctx fn |> removeDuplicatesFromInheritingTypes
 
+  let getKnownTypes (ctx: TyperContext<_, _>) t =
+    findTypes (fun state -> function
+      | Ident { fullName = fns } -> None, state, List.map KnownType.Ident fns
+      | AnonymousInterface a ->
+        let info =
+          ctx |> TyperContext.bindCurrentSourceInfo (fun info -> info.anonymousInterfacesMap |> Map.tryFind a)
+        None, state,
+        match info with
+        | None -> []
+        | Some info -> [KnownType.AnonymousInterface (a, info)]
+      | _ -> None, state, []
+    ) () t |> Set.ofSeq
+
   let rec resolveErasedTypeImpl typeQueries ctx = function
     | PolymorphicThis -> PolymorphicThis | Intrinsic -> Intrinsic
     | Ident i -> Ident i | TypeVar v -> TypeVar v | Prim p -> Prim p | TypeLiteral l -> TypeLiteral l
@@ -920,10 +937,6 @@ module Type =
         let s2 = getHumanReadableName ctx t2 |> Naming.toCase Naming.Case.PascalCase
         s1 + s2
     | UnknownType _ -> "unknown"
-
-type [<RequireQualifiedAccess>] KnownType =
-  | Ident of fullName:FullName
-  | AnonymousInterface of AnonymousInterface * AnonymousInterfaceInfo
 
 module Statement =
   open Type
