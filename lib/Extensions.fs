@@ -69,6 +69,14 @@ module List =
       ) ([], [])
     List.rev xs1, List.rev xs2
 
+  let splitChoice3 (xs: Choice<'t1, 't2, 't3> list) : 't1 list * 't2 list * 't3 list =
+    let xs1, xs2, xs3 =
+      xs |> List.fold (fun (xs1, xs2, xs3) -> function
+        | Choice1Of3 x -> x :: xs1, xs2, xs3
+        | Choice2Of3 x -> xs1, x :: xs2, xs3
+        | Choice3Of3 x -> xs1, xs2, x :: xs3) ([], [], [])
+    List.rev xs1, List.rev xs2, List.rev xs3
+
 module Map =
   let addNoOverwrite k v m =
     m |> Map.change k (function None -> Some v | Some v -> Some v)

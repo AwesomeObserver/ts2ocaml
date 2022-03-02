@@ -87,11 +87,23 @@ type [<RequireQualifiedAccess>] KnownType =
   | Ident of fullName:FullName
   | AnonymousInterface of AnonymousInterface * AnonymousInterfaceInfo
 
+type [<RequireQualifiedAccess>] ExportType =
+  | Child of ExportType * path:string list
+  | CommonJS
+  | ES6Default
+  | ES6 of renameAs:string option
+with
+  member this.CreateChild(name) =
+    match this with
+    | Child (e, path) -> Child (e, path @ [name])
+    | e -> Child (e, [name])
+
 type SourceFileInfo = {
   sourceFile: SourceFile
   definitionsMap: Trie<string, Definition list>
   typeLiteralsMap: Map<Literal, int>
   anonymousInterfacesMap: Map<AnonymousInterface, AnonymousInterfaceInfo>
+  exportMap: Trie<string, ExportType>
   unknownIdentTypes: Trie<string, Set<int>>
 }
 
@@ -192,6 +204,11 @@ module TyperContext =
       ctx.logger.errorf "%s not in [%s]" ctx._currentSourceFile (ctx._info |> Map.toSeq |> Seq.map fst |> String.concat ", ")
     ctx._info |> Map.tryFind ctx._currentSourceFile |> Option.bind f
 
+  let getExportTypeOfName (name: string list) (ctx: TyperContext<'a, 's>) =
+    ctx |> bindCurrentSourceInfo (fun info ->
+      info.exportMap |> Trie.tryFind (ctx.currentNamespace @ name)
+    )
+
 module FullName =
   let getDefinitions (ctx: TyperContext<_, _>) (fullName: FullName) : Definition list =
     match ctx.info |> Map.tryFind fullName.source with
@@ -200,6 +217,11 @@ module FullName =
       info.definitionsMap
       |> Trie.tryFind fullName.name
       |> Option.defaultValue []
+
+  let getExportType (ctx: TyperContext<_, _>) (fullName: FullName) : ExportType option =
+    match ctx.info |> Map.tryFind fullName.source with
+    | None -> None
+    | Some info -> info.exportMap |> Trie.tryFind fullName.name
 
   let private classify = function
     | Definition.TypeAlias _ -> Kind.OfTypeAlias
@@ -940,56 +962,6 @@ module Type =
 
 module Statement =
   open Type
-
-  let createDefinitionsMap (stmts: Statement list) : Trie<string, Definition list> =
-    let add ns name x trie =
-      let key = List.rev (name :: ns)
-      trie |> Trie.addOrUpdate key [x] List.append
-    let rec go (ns: string list) trie s =
-      match s with
-      | Export _
-      | ReExport _
-      | UnknownStatement _
-      | FloatingComment _ -> trie
-      | Import import ->
-        import.clauses
-        |> List.fold (fun trie c ->
-          match c with
-          | NamespaceImport i -> trie |> add ns i.name (Definition.Import (c, import))
-          | ES6WildcardImport _ -> trie
-          | ES6Import i -> trie |> add ns i.name (Definition.Import (c, import))
-          | ES6DefaultImport i -> trie |> add ns i.name (Definition.Import (c, import))
-          | LocalImport i -> trie |> add ns i.name (Definition.Import (c, import))
-        ) trie
-      | TypeAlias a -> trie |> add ns a.name (Definition.TypeAlias a)
-      | Class c ->
-        match c.name with
-        | Name name ->
-          c.members
-          |> List.fold (fun trie (ma, m) ->
-            let ns = name :: ns
-            let d = Definition.Member (ma, m, c)
-            match m with
-            | Field (fl, _) | Getter fl | Setter fl -> trie |> add ns fl.name d
-            | Method (n, _, _) -> trie |> add ns n d
-            | _ -> trie
-          ) trie
-          |> add ns name (Definition.Class c)
-        | ExportDefaultUnnamedClass -> trie
-      | Enum e ->
-        e.cases
-        |> List.fold (fun trie c -> trie |> add (e.name :: ns) c.name (Definition.EnumCase (c, e))) trie
-        |> add ns e.name (Definition.Enum e)
-      | Variable v -> trie |> add ns v.name (Definition.Variable v)
-      | Function f -> trie |> add ns f.name (Definition.Function f)
-      | Pattern p -> p.underlyingStatements |> List.fold (go ns) trie
-      | Module m ->
-        m.statements
-        |> List.fold (go (m.name :: ns)) trie
-        |> add ns m.name (Definition.Module m)
-      | Global m ->
-        m.statements |> List.fold (go []) trie
-    stmts |> List.fold (go []) Trie.empty
 
   type StatementFinder<'State, 'Result> =
     string list -> 'State -> Statement -> Statement list option * 'State * 'Result seq
@@ -1980,16 +1952,128 @@ let replaceFunctions (ctx: #IContext<#TyperOptions>) (stmts: Statement list) =
     | _ -> None
   Statement.mapTypeWith goStatement goType (fun _ x -> x) id ctx stmts
 
+let createExportMap (stmts: Statement list) : Trie<string, ExportType> =
+  let add ns name xo trie =
+    match xo with
+    | Some x -> trie |> Trie.add (List.rev (name :: ns)) x
+    | None -> trie
+  let rec go (eo: ExportType option) (ns: string list) trie stmts =
+    let exportMap =
+      stmts
+      |> List.collect (function
+        | Export e ->
+          e.clauses |> List.choose (function
+            | CommonJsExport { name = [name] } ->
+              Some (name, ExportType.CommonJS)
+            | ES6DefaultExport { name = [name] } ->
+              Some (name, ExportType.ES6Default)
+            | ES6Export e when e.target.name.Length = 1 ->
+              let name = e.target.name[0]
+              Some (name, ExportType.ES6 e.renameAs)
+            | _ -> None
+          )
+        | _ -> [])
+      |> Map.ofList
+    let getExportType name (isExported: Exported) =
+      match isExported with
+      | Exported.Yes -> Some (ExportType.ES6 None)
+      | Exported.Default -> Some ExportType.ES6Default
+      | Exported.Declared | Exported.No ->
+        match exportMap |> Map.tryFind name with
+        | Some e -> Some e
+        | None -> eo |> Option.map (fun e -> e.CreateChild name)
+    let rec f trie s =
+      match s with
+      | Export _ | ReExport _ | UnknownStatement _ | FloatingComment _ | Import _ | TypeAlias _ -> trie
+      | Pattern p -> p.underlyingStatements |> List.fold f trie
+      | Module m ->
+        if m.isNamespace then
+          let eo = getExportType m.name m.isExported
+          let trie = trie |> add ns m.name eo
+          go eo (m.name :: ns) trie m.statements
+        else
+          go None (m.name :: ns) trie m.statements
+      | Global m -> go None [] trie m.statements
+      | Class c ->
+        if c.isInterface then trie
+        else
+          match c.name with
+          | ExportDefaultUnnamedClass -> trie
+          | Name n -> trie |> add ns n (getExportType n c.isExported)
+      | Enum e ->
+        let eo = getExportType e.name e.isExported
+        let trie = trie |> add ns e.name eo
+        e.cases |> List.fold (fun trie c ->
+          let ceo = eo |> Option.map (fun e -> e.CreateChild c.name)
+          trie |> add (e.name :: ns) c.name ceo
+        ) trie
+      | Variable { name = name; isExported = isExported }
+      | Function { name = name; isExported = isExported } ->
+        trie |> add ns name (getExportType name isExported)
+    stmts |> List.fold f trie
+  go None [] Trie.empty stmts
+
+let createDefinitionsMap (stmts: Statement list) : Trie<string, Definition list> =
+  let add ns name x trie =
+    let key = List.rev (name :: ns)
+    trie |> Trie.addOrUpdate key [x] List.append
+  let rec go (ns: string list) trie s =
+    match s with
+    | Export _
+    | ReExport _
+    | UnknownStatement _
+    | FloatingComment _ -> trie
+    | Import import ->
+      import.clauses
+      |> List.fold (fun trie c ->
+        match c with
+        | NamespaceImport i -> trie |> add ns i.name (Definition.Import (c, import))
+        | ES6WildcardImport _ -> trie
+        | ES6Import i -> trie |> add ns i.name (Definition.Import (c, import))
+        | ES6DefaultImport i -> trie |> add ns i.name (Definition.Import (c, import))
+        | LocalImport i -> trie |> add ns i.name (Definition.Import (c, import))
+      ) trie
+    | TypeAlias a -> trie |> add ns a.name (Definition.TypeAlias a)
+    | Class c ->
+      match c.name with
+      | Name name ->
+        c.members
+        |> List.fold (fun trie (ma, m) ->
+          let ns = name :: ns
+          let d = Definition.Member (ma, m, c)
+          match m with
+          | Field (fl, _) | Getter fl | Setter fl -> trie |> add ns fl.name d
+          | Method (n, _, _) -> trie |> add ns n d
+          | _ -> trie
+        ) trie
+        |> add ns name (Definition.Class c)
+      | ExportDefaultUnnamedClass -> trie
+    | Enum e ->
+      e.cases
+      |> List.fold (fun trie c -> trie |> add (e.name :: ns) c.name (Definition.EnumCase (c, e))) trie
+      |> add ns e.name (Definition.Enum e)
+    | Variable v -> trie |> add ns v.name (Definition.Variable v)
+    | Function f -> trie |> add ns f.name (Definition.Function f)
+    | Pattern p -> p.underlyingStatements |> List.fold (go ns) trie
+    | Module m ->
+      m.statements
+      |> List.fold (go (m.name :: ns)) trie
+      |> add ns m.name (Definition.Module m)
+    | Global m ->
+      m.statements |> List.fold (go []) trie
+  stmts |> List.fold (go []) Trie.empty
+
 let private createRootContextForTyper (srcs: SourceFile list) (baseCtx: IContext<'Options>) : TyperContext<'Options, unit> =
   let info =
     srcs
     |> List.map (fun sf ->
       sf.fileName,
       { sourceFile = sf
-        definitionsMap = Statement.createDefinitionsMap sf.statements
+        definitionsMap = createDefinitionsMap sf.statements
         typeLiteralsMap = Map.empty
         anonymousInterfacesMap = Map.empty
-        unknownIdentTypes = Trie.empty })
+        unknownIdentTypes = Trie.empty
+        exportMap = Trie.empty })
     |> Map.ofList
   { _currentSourceFile = ""; _currentNamespace = [];
     _info = info; _state = ()
@@ -2007,10 +2091,12 @@ let createRootContext (srcs: SourceFile list) (baseCtx: IContext<'Options>) : Ty
             Statement.getAnonymousInterfaces stmts
             |> Seq.mapi (fun i (c, info) -> c, { id = i; namespace_ = info.namespace_; origin = info.origin }) |> Map.ofSeq
           let uit = Statement.getUnknownIdentTypes ctx stmts
+          let exm = createExportMap stmts
           { v with
               typeLiteralsMap = tlm
               anonymousInterfacesMap = aim
-              unknownIdentTypes = uit }
+              unknownIdentTypes = uit
+              exportMap = exm }
         ) }
 
 module Ts = TypeScript.Ts
