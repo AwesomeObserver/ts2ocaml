@@ -157,6 +157,57 @@ module Test =
         printfn "* copied to %s" file
       inDirectory testDir <| fun () -> dune "build"
 
+  module Res =
+    let testDir = testDir </> "res"
+    let outputDir = outputDir </> "test_res"
+    let srcDir = testDir </> "src"
+    let srcGeneratedDir = testDir </> "src" </> "generated"
+
+    let clean () =
+      !! $"{outputDir}/*"
+      ++ $"{srcGeneratedDir}/*.res"
+      ++ $"{srcGeneratedDir}/generated/*.resi"
+      |> Seq.iter Shell.rm
+
+    let generateBindings () =
+      Directory.create outputDir
+
+      let ts2res args files =
+        Yarn.exec (sprintf "ts2ocaml res %s" (String.concat " " (Seq.append args files))) id
+
+      ts2res ["--verbose"; "--nowarn"; "--stdlib"; $"-o {outputDir}"] <|
+        !! "node_modules/typescript/lib/lib.*.d.ts"
+
+      let packages = [
+         // "full" package involving a lot of inheritance
+         "full", !! "node_modules/typescript/lib/typescript.d.ts", [];
+
+         // "full" packages involving a lot of dependencies (which includes some "safe" packages)
+         "safe", !! "node_modules/@types/scheduler/tracing.d.ts", [];
+         "full", !! "node_modules/csstype/index.d.ts", [];
+         "safe", !! "node_modules/@types/prop-types/index.d.ts", [];
+         "full", !! "node_modules/@types/react/index.d.ts" ++ "node_modules/@types/react/global.d.ts", ["--readable-names"];
+         "full", !! "node_modules/@types/react-modal/index.d.ts", ["--readable-names"];
+
+         // "safe" package which depends on another "safe" package
+         "safe", !! "node_modules/@types/yargs-parser/index.d.ts", [];
+         "safe", !! "node_modules/@types/yargs/index.d.ts", [];
+
+         "minimal", !! "node_modules/@types/vscode/index.d.ts", ["--safe-arity=full"; "--readable-names"];
+      ]
+
+      for preset, package, additionalOptions in packages do
+        ts2res
+          (["--verbose"; "--nowarn"; "--follow-relative-references";
+            $"--preset {preset}"; $"-o {outputDir}"] @ additionalOptions)
+          package
+
+    let build () =
+      for file in outputDir |> Shell.copyRecursiveTo true srcGeneratedDir do
+        printfn "* copied to %s" file
+      // inDirectory testDir <| fun () -> dune "build"
+
+
 Target.create "TestJsooClean" <| fun _ -> Test.Jsoo.clean ()
 Target.create "TestJsooGenerateBindings" <| fun _ -> Test.Jsoo.generateBindings ()
 Target.create "TestJsooBuild" <| fun _ -> Test.Jsoo.build ()
@@ -167,6 +218,17 @@ Target.create "TestJsoo" ignore
   ==> "TestJsooGenerateBindings"
   ==> "TestJsooBuild"
   ==> "TestJsoo"
+
+Target.create "TestResClean" <| fun _ -> Test.Res.clean ()
+Target.create "TestResGenerateBindings" <| fun _ -> Test.Res.generateBindings ()
+Target.create "TestResBuild" <| fun _ -> Test.Res.build ()
+Target.create "TestRes" ignore
+
+"BuildForTest"
+  ==> "TestResClean"
+  ==> "TestResGenerateBindings"
+  ==> "TestResBuild"
+  ==> "TestRes"
 
 Target.create "Test" ignore
 Target.create "TestOnly" ignore
