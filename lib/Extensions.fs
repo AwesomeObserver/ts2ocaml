@@ -42,7 +42,7 @@ module String =
   let escape (s: string) =
     s
      .Replace("\\", "\\\\")
-     .Replace("'", "\\'").Replace("\"", "\\\"")
+     .Replace("\"", "\\\"")
      .Replace("\b", "\\b").Replace("\n", "\\n").Replace("\r", "\\r")
      .Replace("\t", "\\t")
 
