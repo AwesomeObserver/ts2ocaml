@@ -165,7 +165,7 @@ module Test =
 
     let clean () =
       !! $"{outputDir}/*"
-      ++ $"{srcGeneratedDir}/*.res"
+      ++ $"{srcGeneratedDir}/generated/*.res"
       ++ $"{srcGeneratedDir}/generated/*.resi"
       |> Seq.iter Shell.rm
 
@@ -203,6 +203,7 @@ module Test =
           package
 
     let build () =
+      Shell.mkdir srcGeneratedDir
       for file in outputDir |> Shell.copyRecursiveTo true srcGeneratedDir do
         printfn "* copied to %s" file
       // inDirectory testDir <| fun () -> dune "build"
