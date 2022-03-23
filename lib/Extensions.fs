@@ -51,6 +51,10 @@ module String =
       state.Replace(e, "\\" + e)
     ) s
 
+  open Fable.Core
+  [<Emit("$0.normalize()")>]
+  let normalize (_: string) : string = jsNative
+
 module Option =
   let iterNone f = function
     | Some x -> Some x

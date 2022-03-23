@@ -16,6 +16,10 @@ type TyperOptions =
   /// Make class inherit `PromiseLike<T>` when it has `then(onfulfilled: T => _, onrejected: _)`.
   abstract inheritPromiselike: bool with get,set
 
+  /// Make class contain all the members inherited from the parent classes.
+  /// Useful for targets without proper nominal subtyping.
+  abstract addAllParentMembersToClass: bool with get,set
+
   /// Replaces alias to function type with named interface.
   /// ```ts
   /// type F = (...) => T      // before
@@ -263,6 +267,12 @@ module Ident =
   let pickDefinitionWithFullName ctx ident (picker: FullName -> Definition -> _ option) =
     getDefinitionsWithFullName ctx ident |> List.tryPick (fun x -> picker x.fullName x.definition)
 
+  let collectDefinition ctx ident collector =
+    getDefinitions ctx ident |> List.collect collector
+
+  let collectDefinitionWithFullName ctx ident (collector: FullName -> Definition -> _ list) =
+    getDefinitionsWithFullName ctx ident |> List.collect (fun x -> collector x.fullName x.definition)
+
   let hasKind (ctx: TyperContext<_, _>) (kind: Kind) (ident: Ident) =
     match ident.kind with
     | Some kinds -> kinds |> Set.contains kind
@@ -298,6 +308,12 @@ module Type =
         args = List.map (mapInArg mapping ctx) f.args }
 
   and mapInClass mapping (ctx: 'Context) (c: Class<'a>) : Class<'a> =
+    { c with
+        implements = c.implements |> List.map (mapping ctx)
+        members = c.members |> List.map (mapInMember mapping ctx)
+        typeParams = c.typeParams |> List.map (mapInTypeParam mapping ctx) }
+
+  and mapInMember mapping ctx (ma, m) =
     let mapMember = function
       | Field (f, m) -> Field (mapInFieldLike mapping ctx f, m)
       | Callable (f, tps) -> Callable (mapInFuncType mapping ctx f, List.map (mapInTypeParam mapping ctx) tps)
@@ -309,10 +325,7 @@ module Type =
       | Method (name, f, tps) -> Method (name, mapInFuncType mapping ctx f, List.map (mapInTypeParam mapping ctx) tps)
       | SymbolIndexer (sn, ft, m) -> SymbolIndexer (sn, mapInFuncType mapping ctx ft, m)
       | UnknownMember msgo -> UnknownMember msgo
-    { c with
-        implements = c.implements |> List.map (mapping ctx)
-        members = c.members |> List.map (fun (a, m) -> a, mapMember m)
-        typeParams = c.typeParams |> List.map (mapInTypeParam mapping ctx) }
+    ma, mapMember m
 
   and mapInFieldLike mapping (ctx: 'Context) (fl: FieldLike) : FieldLike =
     { fl with value = mapping ctx fl.value }
@@ -635,6 +648,9 @@ module Type =
       | App (APrim p, ts, _) ->
         if includeSelf then
           yield InheritingType.Prim (p, ts), depth
+      | Intersection i ->
+        for t in i.types do
+          yield! getAllInheritancesImpl (depth+1) includeSelf ctx t
       | _ ->
         if includeSelf then
           yield InheritingType.Other ty, depth
@@ -696,6 +712,12 @@ module Type =
   let getAllInheritancesFromName ctx fn = getAllInheritancesFromNameImpl 0 false ctx fn |> removeDuplicatesFromInheritingTypes
   let getAllInheritancesAndSelf ctx ty = getAllInheritancesImpl 0 true ctx ty |> removeDuplicatesFromInheritingTypes
   let getAllInheritancesAndSelfFromName ctx fn = getAllInheritancesFromNameImpl 0 true ctx fn |> removeDuplicatesFromInheritingTypes
+
+  let isSuperClass ctx (super: Type) (sub: Type) =
+    Set.isProperSubset (getAllInheritancesAndSelf ctx super) (getAllInheritancesAndSelf ctx sub)
+
+  let isSubClass ctx (sub: Type) (super: Type) =
+    Set.isProperSuperset (getAllInheritancesAndSelf ctx super) (getAllInheritancesAndSelf ctx sub)
 
   let getKnownTypes (ctx: TyperContext<_, _>) t =
     findTypes (fun state -> function
@@ -1755,6 +1777,79 @@ let addDefaultConstructorToClass (ctx: TyperContext<_, _>) (stmts: Statement lis
       | x -> x)
   go stmts
 
+[<RequireQualifiedAccess; StructuralEquality; StructuralComparison>]
+type private MemberType =
+  | Getter of string | Setter of string
+  | Method of string * int | Callable of int | Newable of int | Indexer of int | Constructor of int
+
+let addParentMembersToClass (ctx: TyperContext<#TyperOptions, _>) (stmts: Statement list) : Statement list =
+  if not ctx.options.addAllParentMembersToClass then stmts
+  else
+    let m = new MutableMap<Location, Class>()
+    let processing = new MutableSet<Location>()
+    let rec addMembers (c: Class) =
+      match m.TryGetValue(c.loc) with
+      | true, c -> c
+      | false, _ when processing.Contains(c.loc) -> c
+      | false, _ ->
+        processing.Add(c.loc) |> ignore
+        // we remove any parent type which is a super type of some other parent type
+        let implements =
+          c.implements
+          |> List.filter (fun t -> c.implements |> List.forall (fun t' -> Type.isSuperClass ctx t t' |> not))
+        let getMemberType m =
+          match m with
+          | Field (fl, _) | Getter fl -> MemberType.Getter (fl.name |> String.normalize) |> Some
+          | Setter fl -> MemberType.Setter (fl.name |> String.normalize) |> Some
+          | Method (name, ft, _) -> MemberType.Method (name |> String.normalize, ft.args.Length) |> Some
+          | Callable (ft, _) -> MemberType.Callable (ft.args.Length) |> Some
+          | Newable (ft, _) -> MemberType.Newable (ft.args.Length) |> Some
+          | Indexer (ft, _) -> MemberType.Indexer (ft.args.Length) |> Some
+          | Constructor ft -> MemberType.Constructor (ft.args.Length) |> Some
+          | SymbolIndexer _ | UnknownMember _ -> None
+        // if a parent member has the same arity as the member in a child,
+        // we should only keep the one from the child.
+        let memberTypes : Set<MemberType> =
+          c.members |> List.choose (snd >> getMemberType) |> Set.ofList
+        let parentMembers : (MemberAttribute * Member) list =
+          let (|Dummy|) _ = []
+          let rec collector : _ -> _ list = function
+            | (Ident ({ loc = loc } & i) & Dummy ts) | App (AIdent i, ts, loc) ->
+              let collect = function
+                | Definition.TypeAlias a ->
+                  if List.isEmpty ts then collector a.target
+                  else
+                    let bindings = Type.createBindings i.name loc a.typeParams ts
+                    collector a.target |> List.map (Type.mapInMember (Type.substTypeVar bindings) ())
+                // we ignore `implements` clauses i.e. interfaces inherited by a class.
+                | Definition.Class c' when c.isInterface || not c'.isInterface ->
+                  if List.isEmpty ts then (addMembers c').members
+                  else
+                    let members = (addMembers c').members
+                    let bindings = Type.createBindings i.name loc c'.typeParams ts
+                    members |> List.map (Type.mapInMember (Type.substTypeVar bindings) ())
+                | _ -> []
+              Ident.collectDefinition ctx i collect |> List.distinct
+            | Intersection i -> i.types |> List.collect collector |> List.distinct
+            | _ -> []
+          implements
+          |> List.collect collector
+          |> List.filter (fun (_, m) ->
+            match getMemberType m with
+            | None -> false
+            | Some mt -> memberTypes |> Set.contains mt |> not)
+          |> List.distinct
+        let c = { c with members = c.members @ parentMembers }
+        m[c.loc] <- c
+        c
+    let rec go stmts =
+      stmts |> List.map (function
+        | Class c when c.isInterface -> Class (addMembers c)
+        | Module m -> Module { m with statements = go m.statements }
+        | Global m -> Global { m with statements = go m.statements }
+        | x -> x)
+    go stmts
+
 let introduceAdditionalInheritance (ctx: IContext<#TyperOptions>) (stmts: Statement list) : Statement list =
   let opts = ctx.options
   let rec go stmts =
@@ -2186,6 +2281,8 @@ let runAll (srcs: SourceFile list) (baseCtx: IContext<#TyperOptions>) =
       withSourceFileContext ctx (fun ctx src ->
         src |> mapStatements (fun stmts ->
           stmts
+          // add members inherited from parent classes/interfaces to interfaces
+          |> addParentMembersToClass ctx
           |> Statement.resolveErasedTypes ctx
           // add common inheritances which tends not to be defined by `extends` or `implements`
           |> introduceAdditionalInheritance ctx
