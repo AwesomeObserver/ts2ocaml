@@ -140,3 +140,14 @@ let removeQuotesAndTrim (s: string) =
     if (c = '\"' || c = ''')
     then s.Trim(c).Trim()
     else s.Trim()
+
+let isValidJSIdentifier (s: string) =
+  if String.IsNullOrEmpty s then false
+  else
+    let cs = s.ToCharArray()
+    if cs[0] |> Char.IsDigit then false
+    else
+      cs |> Array.forall (fun c ->
+        Char.IsLetterOrDigit(c)
+        || c = '_' || c = '$'
+      )

@@ -183,6 +183,8 @@ module TyperContext =
       | _ -> List.rev ctx._currentNamespace @ name
     { name = name; source = ctx._currentSourceFile }
 
+  let getFullNameOfCurrentNamespace (ctx: TyperContext<'a, 's>) : FullName = getFullName [] ctx
+
   let getFullNameString (name: string list) (ctx: TyperContext<'a, 's>) =
     (getFullName name ctx).name |> String.concat "."
 
@@ -532,6 +534,14 @@ module Type =
       | { defaultType = None } :: rest -> go i rest
       | [] -> []
     maxArity :: go maxArity typrms |> Set.ofList
+
+  let matchArity arity (typrms: TypeParam list) : TypeParam list option =
+    let rec go i acc = function
+      | tp :: rest when i > 0 -> go (i-1) (tp :: acc) rest
+      | { defaultType = None } :: _ -> None
+      | { defaultType = Some _ } :: rest -> go 0 acc rest
+      | [] -> if i = 0 then List.rev acc |> Some else None
+    go arity [] typrms
 
   let createFunctionInterface (funcs: {| ty: FuncType<Type>; typrms: TypeParam list; comments: Comment list; loc: Location; isNewable: bool |} list) =
     let usedTyprms =
@@ -1761,7 +1771,14 @@ let introduceAdditionalInheritance (ctx: IContext<#TyperOptions>) (stmts: Statem
           )
 
         let inline app t ts loc =
-          App (AIdent { name = [t]; kind = Some (Set.ofList [Kind.Type; Kind.ClassLike; Kind.Statement]); fullName = []; loc = loc; parent = None}, ts, loc)
+          App (
+            AIdent {
+              name = [t]
+              kind = Some (Set.ofList [Kind.Type; Kind.ClassLike; Kind.Statement])
+              fullName = [{ name = [t]; source = "lib.es.d.ts" }]
+              loc = loc
+              parent = None
+            }, ts, loc)
 
         for ma, m in c.members do
           match m with
